@@ -25,20 +25,38 @@ impl ImageManager {
         ConfigManager::get_data_dir().join("rootfs")
     }
 
+    pub fn find_system_image() -> Option<PathBuf> {
+        let candidates = [
+            Self::get_images_dir().join("system.img"),
+            PathBuf::from("/usr/share/waydroid-extra/images/system.img"),
+            PathBuf::from("/var/lib/waydroid/images/system.img"),
+        ];
+        candidates.into_iter().find(|p| p.exists())
+    }
+
+    pub fn find_vendor_image() -> Option<PathBuf> {
+        let candidates = [
+            Self::get_images_dir().join("vendor.img"),
+            PathBuf::from("/usr/share/waydroid-extra/images/vendor.img"),
+            PathBuf::from("/var/lib/waydroid/images/vendor.img"),
+        ];
+        candidates.into_iter().find(|p| p.exists())
+    }
+
     pub fn check_status() -> ImageStatus {
         let images_dir = Self::get_images_dir();
         let rootfs_dir = Self::get_rootfs_dir();
 
-        let system_img = images_dir.join("system.img");
-        let vendor_img = images_dir.join("vendor.img");
+        let system_img = Self::find_system_image();
+        let vendor_img = Self::find_vendor_image();
         let init_bin = rootfs_dir.join("init");
 
         ImageStatus {
             images_dir,
             rootfs_dir,
-            system_img_exists: system_img.exists(),
-            vendor_img_exists: vendor_img.exists(),
-            rootfs_ready: init_bin.exists(),
+            system_img_exists: system_img.is_some(),
+            vendor_img_exists: vendor_img.is_some(),
+            rootfs_ready: init_bin.exists() || system_img.is_some(),
         }
     }
 
@@ -50,3 +68,4 @@ impl ImageManager {
         Ok(())
     }
 }
+

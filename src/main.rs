@@ -184,6 +184,20 @@ fn main() -> anyhow::Result<()> {
                 (target.clone(), None)
             };
 
+            // Check if Android system images are installed
+            let img_status = ImageManager::check_status();
+            if !img_status.system_img_exists {
+                eprintln!("\n⚠️  ВНИМАНИЕ: Системный образ Android (system.img) не найден!");
+                eprintln!("   Без системного образа (LineageOS / AOSP) Android-приложение не сможет отрисовать окно.");
+                eprintln!("   👉 Установите образ командой: sudo pacman -S waydroid-image");
+                eprintln!("      или поместите system.img в: {}", img_status.images_dir.display());
+
+                notify_desktop(
+                    "RustyDroid: Требуется образ Android",
+                    "Установите 'waydroid-image' (sudo pacman -S waydroid-image) для запуска окна приложения",
+                );
+            }
+
             // Ensure container session is running
             if !SessionManager::is_running() {
                 println!("⚙️  Starting RustyDroid container session...");
@@ -196,7 +210,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             // If APK file, install it
-            if is_apk && AdbClient::is_adb_available() {
+            if is_apk && AdbClient::is_adb_available() && AdbClient::is_device_connected() {
                 println!("📲 Verifying installation in container...");
                 let _ = AdbClient::install_apk(&target);
             }
@@ -204,22 +218,39 @@ fn main() -> anyhow::Result<()> {
             // Launch Activity
             if let Some(act) = activity {
                 println!("▶️  Launching activity: {} ...", act);
-                if AdbClient::is_adb_available() {
+                if AdbClient::is_adb_available() && AdbClient::is_device_connected() {
                     match AdbClient::start_activity(&package, &act) {
-                        Ok(res) => println!("✅ {}", res.trim()),
-                        Err(e) => eprintln!("⚠️ Launch note: {}", e),
+                        Ok(res) => {
+                            println!("✅ {}", res.trim());
+                            notify_desktop("RustyDroid", &format!("Приложение {} успешно запущено!", package));
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️ Launch note: {}", e);
+                            notify_desktop("RustyDroid: Ошибка запуска", &format!("Не удалось запустить: {}", e));
+                        }
                     }
+                } else if !img_status.system_img_exists {
+                    eprintln!("⚠️  Служба Android не активна: отсутствует system.img (окно не появится).");
+                } else {
+                    println!("ℹ️ Контейнер запущен, ожидание инициализации adbd...");
                 }
             } else {
                 println!("▶️  Launching package: {} ...", package);
-                if AdbClient::is_adb_available() {
+                if AdbClient::is_adb_available() && AdbClient::is_device_connected() {
                     let cmd = format!("monkey -p {} -c android.intent.category.LAUNCHER 1", package);
                     let _ = AdbClient::shell_command(&["sh", "-c", &cmd]);
                 }
             }
 
-            println!("✨ Done! Application window should appear on your Wayland display.");
+            if img_status.system_img_exists && AdbClient::is_device_connected() {
+                println!("✨ Done! Application window should appear on your Wayland display.");
+            } else if !img_status.system_img_exists {
+                println!("⚠️  Контейнер запущен, но для появления окна приложения требуется системный образ: sudo pacman -S waydroid-image");
+            } else {
+                println!("✨ Session started. Waiting for Android subsystem to become ready.");
+            }
         }
+
 
         Commands::Init => {
             println!("🛠️  Initializing RustyDroid Environment...");

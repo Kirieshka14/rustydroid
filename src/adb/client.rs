@@ -17,6 +17,15 @@ impl AdbClient {
             .unwrap_or(false)
     }
 
+    /// Checks if an Android device or container adb daemon is connected
+    pub fn is_device_connected() -> bool {
+        Command::new("adb")
+            .args(&["get-state"])
+            .output()
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "device")
+            .unwrap_or(false)
+    }
+
     /// Installs an APK into the running container
     pub fn install_apk(apk_path: &str) -> Result<String> {
         let output = Command::new("adb")
