@@ -131,11 +131,21 @@ impl NamespaceManager {
                     let path = entry.path();
                     let name = entry.file_name();
                     let target = format!("/{}", name.to_string_lossy());
-                    if path.is_dir() {
+                    if path.is_symlink() {
+                        if let Ok(link_target) = fs::read_link(&path) {
+                            cmd.arg("--symlink").arg(&link_target).arg(&target);
+                        }
+                    } else if path.is_dir() {
                         cmd.arg("--dir").arg(&target);
+                        cmd.arg("--ro-bind").arg(&path).arg(&target);
+                    } else {
+                        cmd.arg("--ro-bind").arg(&path).arg(&target);
                     }
-                    cmd.arg("--ro-bind").arg(&path).arg(&target);
                 }
+            }
+            // Also ensure host basic binaries are accessible if needed
+            if Path::new("/usr").exists() {
+                cmd.arg("--ro-bind-try").arg("/usr").arg("/usr");
             }
         } else {
             // Development and host tooling fallback
