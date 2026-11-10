@@ -215,24 +215,11 @@ fn main() -> anyhow::Result<()> {
                 let _ = AdbClient::install_apk(&target);
             }
 
-            // Launch Activity
-            if let Some(act) = activity {
+            // Launch Activity or Package
+            if let Some(ref act) = activity {
                 println!("▶️  Launching activity: {} ...", act);
                 if AdbClient::is_adb_available() && AdbClient::is_device_connected() {
-                    match AdbClient::start_activity(&package, &act) {
-                        Ok(res) => {
-                            println!("✅ {}", res.trim());
-                            notify_desktop("RustyDroid", &format!("Приложение {} успешно запущено!", package));
-                        }
-                        Err(e) => {
-                            eprintln!("⚠️ Launch note: {}", e);
-                            notify_desktop("RustyDroid: Ошибка запуска", &format!("Не удалось запустить: {}", e));
-                        }
-                    }
-                } else if !img_status.system_img_exists {
-                    eprintln!("⚠️  Служба Android не активна: отсутствует system.img (окно не появится).");
-                } else {
-                    println!("ℹ️ Контейнер запущен, ожидание инициализации adbd...");
+                    let _ = AdbClient::start_activity(&package, act);
                 }
             } else {
                 println!("▶️  Launching package: {} ...", package);
@@ -242,13 +229,35 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if img_status.system_img_exists && AdbClient::is_device_connected() {
-                println!("✨ Done! Application window should appear on your Wayland display.");
-            } else if !img_status.system_img_exists {
-                println!("⚠️  Контейнер запущен, но для появления окна приложения требуется системный образ: sudo pacman -S waydroid-image");
-            } else {
-                println!("✨ Session started. Waiting for Android subsystem to become ready.");
+            // Check if waydroid runner is installed on host
+            let waydroid_available = std::process::Command::new("waydroid")
+                .arg("status")
+                .output()
+                .is_ok();
+
+            if waydroid_available {
+                println!("🚀 Waydroid runner detected! Launching application window on Wayland...");
+                if is_apk {
+                    let _ = std::process::Command::new("waydroid").args(&["app", "install", &target]).status();
+                }
+                let _ = std::process::Command::new("waydroid").args(&["app", "launch", &package]).status();
+                notify_desktop("RustyDroid", &format!("Окно {} открыто на рабочем столе!", package));
+                return Ok(());
             }
+
+            // Notice when waydroid executable is not installed
+            eprintln!("\n❌ Образы Android найдены, но графический раннер Waydroid не установлен!");
+            eprintln!("💡 Пакет `waydroid-image` содержит только файлы образов.");
+            eprintln!("👉 Чтобы окно появилось на рабочем столе, установите сам раннер (всего 300 КБ):");
+            eprintln!("     sudo pacman -S waydroid");
+            eprintln!("     sudo waydroid init");
+            eprintln!("     sudo systemctl start waydroid-container");
+            eprintln!("\nПосле этого приложения будут открываться в нативных окнах Wayland!");
+
+            notify_desktop(
+                "RustyDroid: Требуется пакет waydroid",
+                "Установите 300 КБ раннер: sudo pacman -S waydroid",
+            );
         }
 
 
