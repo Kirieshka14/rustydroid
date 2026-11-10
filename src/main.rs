@@ -59,13 +59,58 @@ enum Commands {
     },
 }
 
+fn normalize_path_str(raw: &str) -> String {
+    let unescaped = if let Some(stripped) = raw.strip_prefix("file://") {
+        percent_decode(stripped)
+    } else {
+        raw.to_string()
+    };
+    unescaped
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            if let (Some(h1), Some(h2)) = (chars.next(), chars.next()) {
+                if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or(""), 16) {
+                    bytes.push(val);
+                    continue;
+                }
+            }
+        }
+        bytes.push(b);
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
+}
+
+fn notify_desktop(title: &str, body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(&["-i", "system-run", title, body])
+        .status();
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Info { apk_path } => {
+            let normalized_str = normalize_path_str(&apk_path.to_string_lossy());
+            let apk_path = PathBuf::from(&normalized_str);
             println!("🔍 Inspecting APK: {}", apk_path.display());
             let meta = ApkInspector::inspect(&apk_path)?;
+            let app_name = meta.app_label.as_deref().unwrap_or(&meta.package_name);
+
+            notify_desktop(
+                &format!("RustyDroid: {}", app_name),
+                &format!(
+                    "Пакет: {}\nВерсия: {}\nРазрешений: {}",
+                    meta.package_name,
+                    meta.version_name.as_deref().unwrap_or("1.0"),
+                    meta.permissions.len()
+                ),
+            );
 
             println!("\n📋 APK Metadata:");
             println!("  • App Label:     {}", meta.app_label.as_deref().unwrap_or("N/A"));
@@ -88,8 +133,11 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Install { apk_path } => {
+            let normalized_str = normalize_path_str(&apk_path.to_string_lossy());
+            let apk_path = PathBuf::from(&normalized_str);
             println!("📦 Installing APK: {}", apk_path.display());
             let meta = ApkInspector::inspect(&apk_path)?;
+            let app_name = meta.app_label.as_deref().unwrap_or(&meta.package_name);
 
             // 1. Generate desktop file and save icon
             let desktop_file = DesktopIntegration::install_desktop_entry(&meta, None)?;
@@ -97,6 +145,11 @@ fn main() -> anyhow::Result<()> {
             if let Some(ref icon) = meta.icon_data {
                 println!("🖼️  Extracted app icon ({} bytes)", icon.len());
             }
+
+            notify_desktop(
+                "RustyDroid",
+                &format!("✅ Приложение {} добавлено в меню приложений!", app_name),
+            );
 
             // 2. Install inside running container if session is active
             if SessionManager::is_running() && AdbClient::is_adb_available() {
@@ -111,18 +164,23 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Run { target } => {
+            let target = normalize_path_str(&target);
             let is_apk = target.ends_with(".apk") || Path::new(&target).exists();
 
             let (package, activity) = if is_apk {
                 println!("📦 Inspecting APK: {}", target);
                 let meta = ApkInspector::inspect(&target)?;
-                println!("🚀 App: {} ({})", meta.app_label.as_deref().unwrap_or(&meta.package_name), meta.package_name);
+                let label = meta.app_label.as_deref().unwrap_or(&meta.package_name).to_string();
+                println!("🚀 App: {} ({})", label, meta.package_name);
+
+                notify_desktop("RustyDroid", &format!("Запуск {}...", label));
 
                 // Ensure desktop integration is present
                 let _ = DesktopIntegration::install_desktop_entry(&meta, None);
 
                 (meta.package_name, meta.main_activity)
             } else {
+                notify_desktop("RustyDroid", &format!("Запуск пакета {}...", target));
                 (target.clone(), None)
             };
 
