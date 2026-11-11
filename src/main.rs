@@ -292,35 +292,70 @@ fn start_waydroid_session_and_wait() -> Result<(), String> {
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("waydroid-session.log");
 
-    let mut cmd = std::process::Command::new("waydroid");
-    cmd.args(&["session", "start"]);
-    cmd.stdin(std::process::Stdio::null());
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    if let Ok(log_file) = std::fs::File::create(&log_path) {
-        if let Ok(log_err) = log_file.try_clone() {
-            cmd.stdout(std::process::Stdio::from(log_file));
-            cmd.stderr(std::process::Stdio::from(log_err));
-        }
+    let launched_via_systemd = if let Ok(wayland_disp) = std::env::var("WAYLAND_DISPLAY") {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "reset-failed", "rustydroid-waydroid-session"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let mut srun = std::process::Command::new("systemd-run");
+        srun.args([
+            "--user",
+            "--quiet",
+            "--collect",
+            "--unit=rustydroid-waydroid-session",
+            &format!("--setenv=WAYLAND_DISPLAY={}", wayland_disp),
+            "--",
+            "waydroid",
+            "session",
+            "start",
+        ]);
+        srun.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     } else {
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-    }
+        false
+    };
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Не удалось запустить waydroid session start: {}", e))?;
+    let mut child = if !launched_via_systemd {
+        let mut cmd = std::process::Command::new("waydroid");
+        cmd.args(&["session", "start"]);
+        cmd.stdin(std::process::Stdio::null());
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        if let Ok(log_file) = std::fs::File::create(&log_path) {
+            if let Ok(log_err) = log_file.try_clone() {
+                cmd.stdout(std::process::Stdio::from(log_file));
+                cmd.stderr(std::process::Stdio::from(log_err));
+            }
+        } else {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+        Some(
+            cmd.spawn()
+                .map_err(|e| format!("Не удалось запустить waydroid session start: {}", e))?,
+        )
+    } else {
+        None
+    };
 
     for _ in 0..120 {
-        if let Ok(Some(_)) = child.try_wait() {
-            let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
-            if log_content.contains("WayDroid container is not listening") {
-                return Err("Служба контейнера Waydroid (waydroid-container) не запущена.\n👉 Запустите: sudo systemctl start waydroid-container".to_string());
+        if let Some(ref mut c) = child {
+            if let Ok(Some(_)) = c.try_wait() {
+                let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if log_content.contains("WayDroid container is not listening") {
+                    return Err("Служба контейнера Waydroid (waydroid-container) не запущена.\n👉 Запустите: sudo systemctl start waydroid-container".to_string());
+                }
+                let summary = log_content.lines().last().unwrap_or("Процесс сессии завершился").to_string();
+                return Err(format!("Сессия Waydroid завершилась с ошибкой: {}", summary));
             }
-            let summary = log_content.lines().last().unwrap_or("Процесс сессии завершился").to_string();
-            return Err(format!("Сессия Waydroid завершилась с ошибкой: {}", summary));
         }
         if check_waydroid_runner_state() == WaydroidRunnerState::Running {
             return Ok(());

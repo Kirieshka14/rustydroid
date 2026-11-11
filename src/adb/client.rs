@@ -443,6 +443,21 @@ impl AdbClient {
         bail!("Не удалось установить пакет после повторных попыток")
     }
 
+    /// Uninstalls a package from the targeted ADB device/container cleanly.
+    pub fn uninstall_target(serial: &str, package_name: &str) -> Result<()> {
+        Self::unfreeze_waydroid_container();
+        let out = Self::run_adb_with_timeout(&["-s", serial, "uninstall", package_name], 30)?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !out.status.success() && !combined.contains("Unknown package") {
+            bail!("Ошибка удаления {}: {}", package_name, combined.trim());
+        }
+        Ok(())
+    }
+
     /// Pushes `.obb` expansion files cleanly to `/sdcard/Android/obb/<pkg>/`.
     pub fn push_obb_files(serial: &str, obb_mappings: &[(PathBuf, String)]) -> Result<()> {
         Self::unfreeze_waydroid_container();

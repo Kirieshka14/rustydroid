@@ -253,28 +253,57 @@ pub fn install_bundle_adapted(
         }
 
         let install_res = AdbClient::install_with_adaptation(ser, &plan.apk_paths, &opts);
-        if let Ok(outcome) = install_res {
-            if let Some(fb) = outcome.used_fallback {
-                println!("🛠️  Применён авто-адаптер установки: {}", fb);
-            }
-            for w in outcome.warnings {
-                println!("⚠️  {}", w);
-            }
-            if !plan.obb_files.is_empty() {
-                println!("📂 Копирование {} OBB кэш-файлов в /sdcard/Android/obb/...", plan.obb_files.len());
-                AdbClient::push_obb_files(ser, &plan.obb_files)?;
-            }
-            cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
-            return Ok(());
-        } else if let Err(adb_err) = install_res {
-            if inspection.compat.format == BundleFormat::SingleApk {
-                eprintln!("⚠️  ADB install вернул ошибку ({}), пробуем waydroid app install...", adb_err);
-                fallback_waydroid_install(&inspection.source_path)?;
-                cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
+        match install_res {
+            Ok(outcome) => {
+                finish_adb_install(ser, outcome, inspection, &plan)?;
                 return Ok(());
             }
-            cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
-            return Err(adb_err);
+            Err(adb_err) => {
+                let err_msg = adb_err.to_string();
+                let is_sig_conflict = err_msg.contains("Конфликт цифровой подписи");
+                if is_sig_conflict {
+                    if prompt_signature_reinstall(&inspection.metadata.package_name) {
+                        println!(
+                            "🗑️  Удаляем старую версию {} (конфликт подписи)...",
+                            inspection.metadata.package_name
+                        );
+                        AdbClient::uninstall_target(ser, &inspection.metadata.package_name)?;
+                        let retry_outcome =
+                            AdbClient::install_with_adaptation(ser, &plan.apk_paths, &opts)?;
+                        finish_adb_install(ser, retry_outcome, inspection, &plan)?;
+                        return Ok(());
+                    }
+                    cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
+                    bail!(
+                        "Приложение {} уже установлено в Waydroid с другой цифровой подписью.\n\
+                         👉 Удалите старую версию (данные приложения будут удалены): adb -s {} uninstall {}\n\
+                         👉 Затем запустите снова: rustydroid run \"{}\"",
+                        inspection.metadata.package_name,
+                        ser,
+                        inspection.metadata.package_name,
+                        inspection.source_path.display()
+                    );
+                }
+
+                let is_definitive_pm_rejection = err_msg.contains("Конфликт")
+                    || err_msg.contains("Несовместимость")
+                    || err_msg.contains("minSdkVersion")
+                    || err_msg.contains("targetSdkVersion")
+                    || err_msg.contains("Недостаточно памяти")
+                    || err_msg.contains("Некорректный или неподписанный")
+                    || err_msg.contains("Уже установлена более новая");
+                if inspection.compat.format == BundleFormat::SingleApk && !is_definitive_pm_rejection {
+                    eprintln!(
+                        "⚠️  ADB install вернул ошибку ({}), пробуем waydroid app install...",
+                        adb_err
+                    );
+                    fallback_waydroid_install(&inspection.source_path)?;
+                    cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
+                    return Ok(());
+                }
+                cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
+                return Err(adb_err);
+            }
         }
     } else if inspection.compat.format == BundleFormat::SingleApk {
         fallback_waydroid_install(&inspection.source_path)?;
@@ -286,8 +315,48 @@ pub fn install_bundle_adapted(
             inspection.compat.format.display_label()
         );
     }
+}
 
+fn finish_adb_install(
+    serial: &str,
+    outcome: crate::adb::client::InstallOutcome,
+    inspection: &BundleInspection,
+    plan: &crate::apk::compat::StagingPlan,
+) -> Result<()> {
+    if let Some(fb) = outcome.used_fallback {
+        println!("🛠️  Применён авто-адаптер установки: {}", fb);
+    }
+    for w in outcome.warnings {
+        println!("⚠️  {}", w);
+    }
+    if !plan.obb_files.is_empty() {
+        println!(
+            "📂 Копирование {} OBB кэш-файлов в /sdcard/Android/obb/...",
+            plan.obb_files.len()
+        );
+        AdbClient::push_obb_files(serial, &plan.obb_files)?;
+    }
+    cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
     Ok(())
+}
+
+fn prompt_signature_reinstall(package_name: &str) -> bool {
+    use std::io::{self, IsTerminal, Write};
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    eprint!(
+        "⚠️  Пакет {} уже установлен с другой цифровой подписью.\n\
+         Удалить старую версию (её данные сотрутся) и установить новую? [y/N]: ",
+        package_name
+    );
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    let ans = line.trim().to_ascii_lowercase();
+    matches!(ans.as_str(), "y" | "yes" | "д" | "да")
 }
 
 fn cleanup_staging_dir(format: &BundleFormat, staging_dir: &Path) {
@@ -326,6 +395,25 @@ pub fn try_connect_waydroid_adb() -> Option<String> {
     }
 }
 
+fn is_waydroid_dbus_session_active() -> bool {
+    Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.DBus",
+            "--object-path",
+            "/org/freedesktop/DBus",
+            "--method",
+            "org.freedesktop.DBus.NameHasOwner",
+            "id.waydro.Session",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("(true,)"))
+        .unwrap_or(false)
+}
+
 /// Launches an installed Android app using `waydroid app launch` with ADB Activity fallback.
 pub fn launch_adapted_app(
     serial: Option<&str>,
@@ -337,6 +425,13 @@ pub fn launch_adapted_app(
     apply_runtime_profile(serial, profile);
 
     println!("🚀 Запуск окна приложения: {} ({}) ...", display_name, package);
+    if !is_waydroid_dbus_session_active() {
+        if let Some(ser) = serial {
+            AdbClient::launch_app_via_adb(ser, package, activity)?;
+            return Ok(());
+        }
+    }
+
     let launch_out = Command::new("waydroid")
         .args(["app", "launch", package])
         .output()
@@ -349,7 +444,10 @@ pub fn launch_adapted_app(
         || waydroid_text_has_error(&stderr)
     {
         if let Some(ser) = serial {
-            eprintln!("⚠️  waydroid app launch недоступен ({}), запускаем напрямую через ADB...", stderr.trim());
+            eprintln!(
+                "⚠️  waydroid app launch недоступен ({}), запускаем напрямую через ADB...",
+                stderr.trim()
+            );
             AdbClient::launch_app_via_adb(ser, package, activity)?;
             return Ok(());
         }
