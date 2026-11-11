@@ -52,11 +52,75 @@ enum Commands {
         /// Command arguments to run inside container
         args: Vec<String>,
     },
+    /// Install and initialize graphical Waydroid runner (requires sudo once)
+    SetupRunner,
     /// Internal container helper for rootless binderfs device initialization
     #[command(hide = true)]
     InternalBinderfs {
         path: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaydroidRunnerState {
+    NotInstalled,
+    NotInitialized,
+    Stopped,
+    Running,
+}
+
+fn parse_waydroid_status_output(combined: &str) -> WaydroidRunnerState {
+    if combined.contains("not initialized") {
+        return WaydroidRunnerState::NotInitialized;
+    }
+
+    if combined.contains("Session:\tRUNNING") || combined.contains("Session: RUNNING") {
+        return WaydroidRunnerState::Running;
+    }
+
+    WaydroidRunnerState::Stopped
+}
+
+fn check_waydroid_runner_state() -> WaydroidRunnerState {
+    let output = match std::process::Command::new("waydroid").arg("status").output() {
+        Ok(o) => o,
+        Err(_) => return WaydroidRunnerState::NotInstalled,
+    };
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_waydroid_status_output(&combined)
+}
+
+fn waydroid_text_has_error(combined: &str) -> bool {
+    combined.contains("ERROR:")
+        || combined.contains("WayDroid session is stopped")
+        || combined.contains("Failed to access IPlatform")
+        || combined.contains("not initialized")
+}
+
+fn waydroid_output_has_error(out: &std::process::Output) -> bool {
+    if !out.status.success() {
+        return true;
+    }
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    waydroid_text_has_error(&combined)
+}
+
+fn find_runner_setup_script() -> Option<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        PathBuf::from(&home).join(".local/bin/install-waydroid-runner.sh"),
+        PathBuf::from("/usr/local/bin/install-waydroid-runner.sh"),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 fn normalize_path_str(raw: &str) -> String {
@@ -85,10 +149,105 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
 }
 
+fn is_headless_or_test_env() -> bool {
+    MountManager::get_wayland_socket().is_none()
+}
+
 fn notify_desktop(title: &str, body: &str) {
+    if is_headless_or_test_env() {
+        return;
+    }
     let _ = std::process::Command::new("notify-send")
         .args(&["-i", "system-run", title, body])
         .status();
+}
+
+fn launch_in_waydroid(target: &str, package: &str, display_name: &str, is_apk: bool) -> anyhow::Result<()> {
+    if is_apk {
+        println!("📲 Установка APK в Waydroid: {} ...", target);
+        let install_out = std::process::Command::new("waydroid")
+            .args(&["app", "install", target])
+            .output()?;
+        if waydroid_output_has_error(&install_out) {
+            let msg = format!(
+                "{}{}",
+                String::from_utf8_lossy(&install_out.stdout),
+                String::from_utf8_lossy(&install_out.stderr)
+            );
+            eprintln!("❌ Ошибка установки APK в Waydroid:\n{}", msg.trim());
+            notify_desktop(
+                "RustyDroid: Ошибка установки APK",
+                &format!("Не удалось установить {}", display_name),
+            );
+            return Ok(());
+        }
+    }
+
+    println!("🚀 Запуск окна приложения: {} ({}) ...", display_name, package);
+    let launch_out = std::process::Command::new("waydroid")
+        .args(&["app", "launch", package])
+        .output()?;
+
+    if waydroid_output_has_error(&launch_out) {
+        let msg = format!(
+            "{}{}",
+            String::from_utf8_lossy(&launch_out.stdout),
+            String::from_utf8_lossy(&launch_out.stderr)
+        );
+        eprintln!("❌ Ошибка при запуске приложения в Waydroid:\n{}", msg.trim());
+        notify_desktop(
+            "RustyDroid: Ошибка запуска",
+            &format!("Не удалось открыть {}", display_name),
+        );
+    } else {
+        println!("✅ Приложение успешно запущено!");
+        notify_desktop("RustyDroid", &format!("Окно {} открыто на рабочем столе!", display_name));
+    }
+    Ok(())
+}
+
+fn start_waydroid_session_and_wait() -> Result<(), String> {
+    let log_dir = ConfigManager::get_data_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("waydroid-session.log");
+
+    let mut cmd = std::process::Command::new("waydroid");
+    cmd.args(&["session", "start"]);
+    cmd.stdin(std::process::Stdio::null());
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    if let Ok(log_file) = std::fs::File::create(&log_path) {
+        if let Ok(log_err) = log_file.try_clone() {
+            cmd.stdout(std::process::Stdio::from(log_file));
+            cmd.stderr(std::process::Stdio::from(log_err));
+        }
+    } else {
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Не удалось запустить waydroid session start: {}", e))?;
+
+    for _ in 0..40 {
+        if let Ok(Some(_)) = child.try_wait() {
+            let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log_content.contains("WayDroid container is not listening") {
+                return Err("Служба контейнера Waydroid (waydroid-container) не запущена.\n👉 Запустите: sudo systemctl start waydroid-container".to_string());
+            }
+            let summary = log_content.lines().last().unwrap_or("Процесс сессии завершился").to_string();
+            return Err(format!("Сессия Waydroid завершилась с ошибкой: {}", summary));
+        }
+        if check_waydroid_runner_state() == WaydroidRunnerState::Running {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    Err("Превышено время ожидания запуска сессии Waydroid (проверьте `waydroid status`).".to_string())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -165,9 +324,9 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Run { target } => {
             let target = normalize_path_str(&target);
-            let is_apk = target.ends_with(".apk") || Path::new(&target).exists();
+            let is_apk = target.to_lowercase().ends_with(".apk") || Path::new(&target).is_file();
 
-            let (package, activity) = if is_apk {
+            let (package, activity, display_name) = if is_apk {
                 println!("📦 Inspecting APK: {}", target);
                 let meta = ApkInspector::inspect(&target)?;
                 let label = meta.app_label.as_deref().unwrap_or(&meta.package_name).to_string();
@@ -178,10 +337,10 @@ fn main() -> anyhow::Result<()> {
                 // Ensure desktop integration is present
                 let _ = DesktopIntegration::install_desktop_entry(&meta, None);
 
-                (meta.package_name, meta.main_activity)
+                (meta.package_name, meta.main_activity, label)
             } else {
                 notify_desktop("RustyDroid", &format!("Запуск пакета {}...", target));
-                (target.clone(), None)
+                (target.clone(), None, target.clone())
             };
 
             // Check if Android system images are installed
@@ -198,7 +357,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
-            // Ensure container session is running
+            // Ensure container session supervisor is running
             if !SessionManager::is_running() {
                 println!("⚙️  Starting RustyDroid container session...");
                 match SessionManager::start_session() {
@@ -209,7 +368,7 @@ fn main() -> anyhow::Result<()> {
                 println!("🟢 Container session is already active.");
             }
 
-            // If APK file, install it
+            // If APK file, install it via ADB if available
             if is_apk && AdbClient::is_adb_available() && AdbClient::is_device_connected() {
                 println!("📲 Verifying installation in container...");
                 let _ = AdbClient::install_apk(&target);
@@ -229,35 +388,39 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Check if waydroid runner is installed on host
-            let waydroid_available = std::process::Command::new("waydroid")
-                .arg("status")
-                .output()
-                .is_ok();
-
-            if waydroid_available {
-                println!("🚀 Waydroid runner detected! Launching application window on Wayland...");
-                if is_apk {
-                    let _ = std::process::Command::new("waydroid").args(&["app", "install", &target]).status();
-                }
-                let _ = std::process::Command::new("waydroid").args(&["app", "launch", &package]).status();
-                notify_desktop("RustyDroid", &format!("Окно {} открыто на рабочем столе!", package));
+            if is_headless_or_test_env() {
+                eprintln!("ℹ️  Wayland display socket not found (graphical runner skipped in headless/sandbox mode).");
                 return Ok(());
             }
 
-            // Notice when waydroid executable is not installed
-            eprintln!("\n❌ Образы Android найдены, но графический раннер Waydroid не установлен!");
-            eprintln!("💡 Пакет `waydroid-image` содержит только файлы образов.");
-            eprintln!("👉 Чтобы окно появилось на рабочем столе, установите сам раннер (всего 300 КБ):");
-            eprintln!("     sudo pacman -S waydroid");
-            eprintln!("     sudo waydroid init");
-            eprintln!("     sudo systemctl start waydroid-container");
-            eprintln!("\nПосле этого приложения будут открываться в нативных окнах Wayland!");
+            match check_waydroid_runner_state() {
+                WaydroidRunnerState::NotInstalled | WaydroidRunnerState::NotInitialized => {
+                    eprintln!("\n❌ Графический раннер Waydroid не установлен или не инициализирован!");
+                    eprintln!("💡 Пакеты раннера и образы Android уже подготовлены локально.");
+                    eprintln!("👉 Для одноразовой настройки (установка из кэша + init + запуск службы) выполните:");
+                    eprintln!("     rustydroid setup-runner");
 
-            notify_desktop(
-                "RustyDroid: Требуется пакет waydroid",
-                "Установите 300 КБ раннер: sudo pacman -S waydroid",
-            );
+                    notify_desktop(
+                        "RustyDroid: Требуется настройка раннера",
+                        "Запустите `rustydroid setup-runner` для инициализации Waydroid",
+                    );
+                }
+                WaydroidRunnerState::Stopped => {
+                    println!("🔄 Запуск сессии Waydroid на рабочем столе...");
+                    match start_waydroid_session_and_wait() {
+                        Ok(()) => {
+                            launch_in_waydroid(&target, &package, &display_name, is_apk)?;
+                        }
+                        Err(err) => {
+                            eprintln!("\n❌ {}", err);
+                            notify_desktop("RustyDroid: Служба не запущена", &err);
+                        }
+                    }
+                }
+                WaydroidRunnerState::Running => {
+                    launch_in_waydroid(&target, &package, &display_name, is_apk)?;
+                }
+            }
         }
 
 
@@ -318,14 +481,23 @@ fn main() -> anyhow::Result<()> {
             let adb_ok = AdbClient::is_adb_available();
             println!("  • ADB Tooling:        {}", if adb_ok { "Available ✅" } else { "Not found (optional) ⚠️" });
 
-            // 8. Session Status
+            // 8. Waydroid Graphical Runner
+            let runner_desc = match check_waydroid_runner_state() {
+                WaydroidRunnerState::NotInstalled => "Not installed ❌",
+                WaydroidRunnerState::NotInitialized => "Not initialized ⚠️ (run `rustydroid setup-runner`)",
+                WaydroidRunnerState::Stopped => "Initialized, session STOPPED ⚪",
+                WaydroidRunnerState::Running => "RUNNING 🟢",
+            };
+            println!("  • Graphical Runner:   {}", runner_desc);
+
+            // 9. Session Status
             let session_info = SessionManager::get_state();
             println!("\n  • Session Status:     {}", match session_info {
                 Some(s) => format!("RUNNING 🟢 (PID: {}, Mode: {})", s.pid, s.display_mode),
                 None => "STOPPED ⚪".to_string(),
             });
 
-            // 9. Images
+            // 10. Images
             let img_status = ImageManager::check_status();
             println!("  • Android Images:     system.img: {}, vendor.img: {}",
                 if img_status.system_img_exists { "Found ✅" } else { "None" },
@@ -357,6 +529,39 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        Commands::SetupRunner => {
+            println!("🛠️  Настройка графического раннера Waydroid...");
+            let Some(script) = find_runner_setup_script() else {
+                anyhow::bail!("Скрипт установки install-waydroid-runner.sh не найден в ~/.local/bin/");
+            };
+
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                let status = std::process::Command::new("sudo")
+                    .arg(&script)
+                    .status()?;
+                if status.success() {
+                    println!("✅ Раннер Waydroid настроен и запущен!");
+                } else {
+                    anyhow::bail!("Установка завершилась с ошибкой (код {:?})", status.code());
+                }
+            } else {
+                let cmd_str = format!(
+                    "sudo '{}'; echo ''; read -p 'Нажмите Enter для закрытия...'",
+                    script.display()
+                );
+                let spawned = std::process::Command::new("kitty")
+                    .args(&["-e", "bash", "-c", &cmd_str])
+                    .spawn();
+                if spawned.is_err() {
+                    let status = std::process::Command::new("pkexec").arg(&script).status()?;
+                    if !status.success() {
+                        anyhow::bail!("Установка через pkexec не завершена");
+                    }
+                }
+            }
+        }
+
         Commands::InternalBinderfs { path } => {
             if BinderManager::is_supported() {
                 let _ = BinderManager::mount_binderfs(&path);
@@ -366,4 +571,46 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_file_uri_and_percent_decode() {
+        assert_eq!(
+            normalize_path_str("file:///home/kiri/%D0%97%D0%B0%D0%B3%D1%80%D1%83%D0%B7%D0%BA%D0%B8/My%20App.apk"),
+            "/home/kiri/Загрузки/My App.apk"
+        );
+        assert_eq!(
+            normalize_path_str("/home/kiri/test.apk"),
+            "/home/kiri/test.apk"
+        );
+    }
+
+    #[test]
+    fn test_parse_waydroid_status_output_variants() {
+        assert_eq!(
+            parse_waydroid_status_output("Waydroid is not initialized, run \"waydroid init\""),
+            WaydroidRunnerState::NotInitialized
+        );
+        assert_eq!(
+            parse_waydroid_status_output("Session:\tSTOPPED\nVendor type:\tMAINLINE\n"),
+            WaydroidRunnerState::Stopped
+        );
+        assert_eq!(
+            parse_waydroid_status_output("Session:\tRUNNING\nContainer:\tRUNNING\nVendor type:\tMAINLINE\n"),
+            WaydroidRunnerState::Running
+        );
+    }
+
+    #[test]
+    fn test_waydroid_text_has_error() {
+        assert!(waydroid_text_has_error("[00:28:30] ERROR: WayDroid session is stopped"));
+        assert!(waydroid_text_has_error("Failed to access IPlatform service"));
+        assert!(waydroid_text_has_error("Waydroid is not initialized, run \"waydroid init\""));
+        assert!(!waydroid_text_has_error(""));
+        assert!(!waydroid_text_has_error("Session:\tRUNNING"));
+    }
 }
