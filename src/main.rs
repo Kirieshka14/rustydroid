@@ -232,7 +232,7 @@ fn start_waydroid_session_and_wait() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Не удалось запустить waydroid session start: {}", e))?;
 
-    for _ in 0..40 {
+    for _ in 0..120 {
         if let Ok(Some(_)) = child.try_wait() {
             let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
             if log_content.contains("WayDroid container is not listening") {
@@ -406,7 +406,8 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 WaydroidRunnerState::Stopped => {
-                    println!("🔄 Запуск сессии Waydroid на рабочем столе...");
+                    println!("🔄 Запуск сессии Waydroid на рабочем столе (первый старт Android может занять до 30 сек)...");
+                    notify_desktop("RustyDroid", "Запуск сессии Android (подождите ~15–30 сек)...");
                     match start_waydroid_session_and_wait() {
                         Ok(()) => {
                             launch_in_waydroid(&target, &package, &display_name, is_apk)?;
