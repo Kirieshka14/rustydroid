@@ -1,15 +1,16 @@
-mod adb;
-mod apk;
-mod binder;
-mod container;
-mod runtime;
-
-use adb::AdbClient;
-use apk::{ApkInspector, DesktopIntegration};
-use binder::BinderManager;
 use clap::{Parser, Subcommand};
-use container::{ContainerConfig, MountManager, NamespaceManager};
-use runtime::{ConfigManager, ImageManager, SessionManager};
+use rustydroid::adb::AdbClient;
+use rustydroid::apk::compat::{
+    is_package_archive_path, ProfileOverrides, ProfileStore, WindowMode,
+};
+use rustydroid::apk::DesktopIntegration;
+use rustydroid::binder::BinderManager;
+use rustydroid::container::{ContainerConfig, MountManager, NamespaceManager};
+use rustydroid::runtime::adapt::{
+    find_arm_setup_script, inspect_target_or_package, install_bundle_adapted, launch_adapted_app,
+    print_compatibility_report, print_profile_fields, try_connect_waydroid_adb,
+};
+use rustydroid::runtime::{ConfigManager, ImageManager, SessionManager};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -24,23 +25,166 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(clap::Args, Debug, Clone, Default)]
+struct AdaptFlags {
+    /// Window adaptation mode: auto, freeform, single, portrait, landscape, custom
+    #[arg(long = "window-mode", value_name = "MODE")]
+    window_mode: Option<String>,
+    /// Override virtual Android window width (pixels)
+    #[arg(long)]
+    width: Option<u32>,
+    /// Override virtual Android window height (pixels)
+    #[arg(long)]
+    height: Option<u32>,
+    /// Override virtual Android LCD density (DPI)
+    #[arg(long)]
+    dpi: Option<u32>,
+    /// Spoof Wi-Fi connectivity for this app (persist.waydroid.fake_wifi)
+    #[arg(long = "fake-wifi", conflicts_with = "no_fake_wifi")]
+    fake_wifi: bool,
+    /// Disable fake Wi-Fi for this app
+    #[arg(long = "no-fake-wifi")]
+    no_fake_wifi: bool,
+    /// Translate mouse clicks/drags into touch events (persist.waydroid.fake_touch)
+    #[arg(long = "fake-touch", conflicts_with = "no_fake_touch")]
+    fake_touch: bool,
+    /// Disable fake touch for this app
+    #[arg(long = "no-fake-touch")]
+    no_fake_touch: bool,
+    /// Force native ABI during installation (e.g. arm64-v8a, armeabi-v7a, x86_64)
+    #[arg(long)]
+    abi: Option<String>,
+    /// Spoof installer package name (default: com.android.vending)
+    #[arg(long, value_name = "PKG")]
+    installer: Option<String>,
+    /// Disable Play Store installer spoofing
+    #[arg(long = "no-spoof")]
+    no_spoof: bool,
+    /// Do not auto-grant runtime permissions (-g) during installation
+    #[arg(long = "no-auto-grant")]
+    no_auto_grant: bool,
+    /// Allow version downgrade (-d) during installation
+    #[arg(long = "allow-downgrade")]
+    allow_downgrade: bool,
+    /// Force low-target-SDK compatibility (--force-sdk)
+    #[arg(long = "force-sdk")]
+    force_sdk: bool,
+    /// Save these adaptation settings as a persistent per-app profile
+    #[arg(long = "save-profile")]
+    save_profile: bool,
+}
+
+impl AdaptFlags {
+    fn to_overrides(&self) -> anyhow::Result<ProfileOverrides> {
+        let window_mode = match self.window_mode.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            None => None,
+            Some("auto") => Some(WindowMode::Auto),
+            Some("freeform") | Some("multi") | Some("multiwindow") => Some(WindowMode::Freeform),
+            Some("single") | Some("fullscreen") => Some(WindowMode::SingleWindow),
+            Some("portrait") | Some("phone") => Some(WindowMode::PhonePortrait),
+            Some("landscape") | Some("tablet") => Some(WindowMode::TabletLandscape),
+            Some("custom") => Some(WindowMode::CustomSize),
+            Some(other) => anyhow::bail!(
+                "Неизвестный режим окна '{}'. Доступны: auto, freeform, single, portrait, landscape, custom",
+                other
+            ),
+        };
+
+        Ok(ProfileOverrides {
+            window_mode,
+            width: self.width,
+            height: self.height,
+            lcd_density: self.dpi,
+            fake_wifi: if self.fake_wifi {
+                Some(true)
+            } else if self.no_fake_wifi {
+                Some(false)
+            } else {
+                None
+            },
+            fake_touch: if self.fake_touch {
+                Some(true)
+            } else if self.no_fake_touch {
+                Some(false)
+            } else {
+                None
+            },
+            auto_grant_permissions: if self.no_auto_grant { Some(false) } else { None },
+            installer_spoof: if self.no_spoof {
+                Some(None)
+            } else if let Some(ref pkg) = self.installer {
+                Some(Some(pkg.clone()))
+            } else {
+                None
+            },
+            abi_override: self.abi.as_ref().map(|s| Some(s.clone())),
+            allow_downgrade: if self.allow_downgrade { Some(true) } else { None },
+            force_sdk: if self.force_sdk { Some(true) } else { None },
+        })
+    }
+
+    fn has_explicit_overrides(&self) -> bool {
+        self.window_mode.is_some()
+            || self.width.is_some()
+            || self.height.is_some()
+            || self.dpi.is_some()
+            || self.fake_wifi
+            || self.no_fake_wifi
+            || self.fake_touch
+            || self.no_fake_touch
+            || self.abi.is_some()
+            || self.installer.is_some()
+            || self.no_spoof
+            || self.no_auto_grant
+            || self.allow_downgrade
+            || self.force_sdk
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum AdaptAction {
+    /// Inspect and show active/recommended adaptation profile for an APK/bundle or package
+    Show { target: String },
+    /// Configure and save per-app adaptation settings
+    Set {
+        target: String,
+        #[command(flatten)]
+        flags: AdaptFlags,
+    },
+    /// Delete saved per-app adaptation override
+    Reset { package_name: String },
+    /// List all saved per-app adaptation profiles
+    List,
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run an APK file or installed Android application
+    /// Run an APK, split bundle (.xapk/.apks/.apkm), or installed Android package
     Run {
-        /// Path to .apk file or package name (e.g. com.example.app)
+        /// Path to .apk/.xapk/.apks/.apkm file or package name (e.g. com.example.app)
         target: String,
+        #[command(flatten)]
+        flags: AdaptFlags,
     },
-    /// Install an APK and create desktop launcher entry (.desktop)
+    /// Install an APK/bundle and create desktop launcher entry (.desktop)
     Install {
-        /// Path to .apk file
+        /// Path to .apk/.xapk/.apks/.apkm file
         apk_path: PathBuf,
+        #[command(flatten)]
+        flags: AdaptFlags,
     },
-    /// Inspect an APK file and print metadata (package, Activity, permissions, icon)
+    /// Inspect an APK/bundle and print metadata + compatibility adaptation report
     Info {
-        /// Path to .apk file
+        /// Path to .apk/.xapk/.apks/.apkm file
         apk_path: PathBuf,
     },
+    /// Manage per-app compatibility & adaptation profiles
+    Adapt {
+        #[command(subcommand)]
+        action: AdaptAction,
+    },
+    /// Install Android ARM/ARM64 (libndk_translation) layer in Waydroid (requires sudo once)
+    SetupArm,
     /// Initialize directories and check system requirements
     Init,
     /// Check system environment, binderfs, GPU, Wayland and session status
@@ -95,25 +239,6 @@ fn check_waydroid_runner_state() -> WaydroidRunnerState {
     parse_waydroid_status_output(&combined)
 }
 
-fn waydroid_text_has_error(combined: &str) -> bool {
-    combined.contains("ERROR:")
-        || combined.contains("WayDroid session is stopped")
-        || combined.contains("Failed to access IPlatform")
-        || combined.contains("not initialized")
-}
-
-fn waydroid_output_has_error(out: &std::process::Output) -> bool {
-    if !out.status.success() {
-        return true;
-    }
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    waydroid_text_has_error(&combined)
-}
-
 fn find_runner_setup_script() -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let candidates = [
@@ -160,50 +285,6 @@ fn notify_desktop(title: &str, body: &str) {
     let _ = std::process::Command::new("notify-send")
         .args(&["-i", "system-run", title, body])
         .status();
-}
-
-fn launch_in_waydroid(target: &str, package: &str, display_name: &str, is_apk: bool) -> anyhow::Result<()> {
-    if is_apk {
-        println!("📲 Установка APK в Waydroid: {} ...", target);
-        let install_out = std::process::Command::new("waydroid")
-            .args(&["app", "install", target])
-            .output()?;
-        if waydroid_output_has_error(&install_out) {
-            let msg = format!(
-                "{}{}",
-                String::from_utf8_lossy(&install_out.stdout),
-                String::from_utf8_lossy(&install_out.stderr)
-            );
-            eprintln!("❌ Ошибка установки APK в Waydroid:\n{}", msg.trim());
-            notify_desktop(
-                "RustyDroid: Ошибка установки APK",
-                &format!("Не удалось установить {}", display_name),
-            );
-            return Ok(());
-        }
-    }
-
-    println!("🚀 Запуск окна приложения: {} ({}) ...", display_name, package);
-    let launch_out = std::process::Command::new("waydroid")
-        .args(&["app", "launch", package])
-        .output()?;
-
-    if waydroid_output_has_error(&launch_out) {
-        let msg = format!(
-            "{}{}",
-            String::from_utf8_lossy(&launch_out.stdout),
-            String::from_utf8_lossy(&launch_out.stderr)
-        );
-        eprintln!("❌ Ошибка при запуске приложения в Waydroid:\n{}", msg.trim());
-        notify_desktop(
-            "RustyDroid: Ошибка запуска",
-            &format!("Не удалось открыть {}", display_name),
-        );
-    } else {
-        println!("✅ Приложение успешно запущено!");
-        notify_desktop("RustyDroid", &format!("Окно {} открыто на рабочем столе!", display_name));
-    }
-    Ok(())
 }
 
 fn start_waydroid_session_and_wait() -> Result<(), String> {
@@ -257,16 +338,24 @@ fn main() -> anyhow::Result<()> {
         Commands::Info { apk_path } => {
             let normalized_str = normalize_path_str(&apk_path.to_string_lossy());
             let apk_path = PathBuf::from(&normalized_str);
-            println!("🔍 Inspecting APK: {}", apk_path.display());
-            let meta = ApkInspector::inspect(&apk_path)?;
-            let app_name = meta.app_label.as_deref().unwrap_or(&meta.package_name);
+            println!("🔍 Inspecting package: {}", apk_path.display());
+            let overrides = ProfileOverrides::default();
+            let (_pkg, _act, app_name, maybe_insp, profile) =
+                inspect_target_or_package(&normalized_str, true, &overrides)?;
+            let inspection = maybe_insp.expect("archive inspection must produce BundleInspection");
+            let meta = &inspection.metadata;
 
             notify_desktop(
                 &format!("RustyDroid: {}", app_name),
                 &format!(
-                    "Пакет: {}\nВерсия: {}\nРазрешений: {}",
+                    "Пакет: {}\nВерсия: {}\nABI: {}\nРазрешений: {}",
                     meta.package_name,
                     meta.version_name.as_deref().unwrap_or("1.0"),
+                    if inspection.compat.native_abis.is_empty() {
+                        "DEX".to_string()
+                    } else {
+                        inspection.compat.native_abis.join(", ")
+                    },
                     meta.permissions.len()
                 ),
             );
@@ -289,20 +378,30 @@ fn main() -> anyhow::Result<()> {
                     println!("    {}. {}", i + 1, short_perm);
                 }
             }
+
+            print_compatibility_report(&inspection, &profile);
         }
 
-        Commands::Install { apk_path } => {
+        Commands::Install { apk_path, flags } => {
             let normalized_str = normalize_path_str(&apk_path.to_string_lossy());
             let apk_path = PathBuf::from(&normalized_str);
-            println!("📦 Installing APK: {}", apk_path.display());
-            let meta = ApkInspector::inspect(&apk_path)?;
-            let app_name = meta.app_label.as_deref().unwrap_or(&meta.package_name);
+            println!("📦 Installing package: {}", apk_path.display());
+            let overrides = flags.to_overrides()?;
+            let (_pkg, _act, app_name, maybe_insp, profile) =
+                inspect_target_or_package(&normalized_str, true, &overrides)?;
+            let inspection = maybe_insp.expect("archive inspection must produce BundleInspection");
+            let meta = &inspection.metadata;
 
             // 1. Generate desktop file and save icon
-            let desktop_file = DesktopIntegration::install_desktop_entry(&meta, None)?;
+            let desktop_file = DesktopIntegration::install_desktop_entry(meta, None)?;
             println!("✅ Desktop entry registered: {}", desktop_file.display());
             if let Some(ref icon) = meta.icon_data {
                 println!("🖼️  Extracted app icon ({} bytes)", icon.len());
+            }
+
+            if flags.save_profile || flags.has_explicit_overrides() {
+                let saved = ProfileStore::save(&profile)?;
+                println!("⚙️  Профиль адаптации сохранён: {}", saved.display());
             }
 
             notify_desktop(
@@ -310,40 +409,58 @@ fn main() -> anyhow::Result<()> {
                 &format!("✅ Приложение {} добавлено в меню приложений!", app_name),
             );
 
-            // 2. Install inside running container if session is active
-            if SessionManager::is_running() && AdbClient::is_adb_available() {
+            // 2. Install inside running Waydroid / container if available
+            if !is_headless_or_test_env() && check_waydroid_runner_state() == WaydroidRunnerState::Running {
+                println!("📲 Установка адаптированного пакета в Waydroid...");
+                let serial = try_connect_waydroid_adb();
+                install_bundle_adapted(&inspection, &profile, serial.as_deref())?;
+                println!("✅ Пакет {} установлен в Waydroid!", meta.package_name);
+            } else if SessionManager::is_running() && AdbClient::is_adb_available() {
                 println!("📲 Installing into running container...");
                 match AdbClient::install_apk(&apk_path.to_string_lossy()) {
                     Ok(out) => println!("✅ {}", out.trim()),
                     Err(e) => eprintln!("⚠️ Container install note: {}", e),
                 }
             } else {
-                println!("ℹ️  Session not active. The app will be installed on first run.");
+                println!("ℹ️  Сессия не активна — пакет будет установлен автоматически при первом запуске.");
             }
         }
 
-        Commands::Run { target } => {
+        Commands::Run { target, flags } => {
             let target = normalize_path_str(&target);
-            let is_apk = target.to_lowercase().ends_with(".apk") || Path::new(&target).is_file();
+            let is_apk = is_package_archive_path(&target);
+            if is_apk && !Path::new(&target).exists() {
+                anyhow::bail!("Failed to open APK file: {}", target);
+            }
 
-            let (package, activity, display_name) = if is_apk {
+            let overrides = flags.to_overrides()?;
+            if is_apk {
                 println!("📦 Inspecting APK: {}", target);
-                let meta = ApkInspector::inspect(&target)?;
-                let label = meta.app_label.as_deref().unwrap_or(&meta.package_name).to_string();
-                println!("🚀 App: {} ({})", label, meta.package_name);
+            } else {
+                println!("📦 Launching package: {}", target);
+            }
+            let (package, activity, display_name, maybe_inspection, profile) =
+                inspect_target_or_package(&target, is_apk, &overrides)?;
 
-                notify_desktop("RustyDroid", &format!("Запуск {}...", label));
-
-                // Ensure desktop integration is present
-                let _ = DesktopIntegration::install_desktop_entry(&meta, None);
-
-                (meta.package_name, meta.main_activity, label)
+            if is_apk {
+                println!("🚀 App: {} ({})", display_name, package);
+                notify_desktop("RustyDroid", &format!("Запуск {}...", display_name));
+                if let Some(ref insp) = maybe_inspection {
+                    let _ = DesktopIntegration::install_desktop_entry(&insp.metadata, None);
+                    for warn in &insp.compat.warnings {
+                        println!("⚠️  {}", warn);
+                    }
+                }
             } else {
                 notify_desktop("RustyDroid", &format!("Запуск пакета {}...", target));
-                (target.clone(), None, target.clone())
-            };
+            }
 
-            // Check if Android system images are installed
+            if flags.save_profile {
+                let saved = ProfileStore::save(&profile)?;
+                println!("⚙️  Профиль адаптации сохранён: {}", saved.display());
+            }
+
+            // Check if Android system images are installed cleanly
             let img_status = ImageManager::check_status();
             if !img_status.system_img_exists {
                 eprintln!("\n⚠️  ВНИМАНИЕ: Системный образ Android (system.img) не найден!");
@@ -357,43 +474,20 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
-            // Ensure container session supervisor is running
-            if !SessionManager::is_running() {
-                println!("⚙️  Starting RustyDroid container session...");
-                match SessionManager::start_session() {
-                    Ok(pid) => println!("🟢 Container session started (PID: {})", pid),
-                    Err(e) => eprintln!("⚠️ Note starting session: {}", e),
-                }
-            } else {
-                println!("🟢 Container session is already active.");
-            }
-
-            // If APK file, install it via ADB if available
-            if is_apk && AdbClient::is_adb_available() && AdbClient::is_device_connected() {
-                println!("📲 Verifying installation in container...");
-                let _ = AdbClient::install_apk(&target);
-            }
-
-            // Launch Activity or Package
-            if let Some(ref act) = activity {
-                println!("▶️  Launching activity: {} ...", act);
-                if AdbClient::is_adb_available() && AdbClient::is_device_connected() {
-                    let _ = AdbClient::start_activity(&package, act);
-                }
-            } else {
-                println!("▶️  Launching package: {} ...", package);
-                if AdbClient::is_adb_available() && AdbClient::is_device_connected() {
-                    let cmd = format!("monkey -p {} -c android.intent.category.LAUNCHER 1", package);
-                    let _ = AdbClient::shell_command(&["sh", "-c", &cmd]);
-                }
-            }
-
+            // Ensure lightweight session state bookkeeping in headless/test runs
             if is_headless_or_test_env() {
+                if !SessionManager::is_running() {
+                    println!("⚙️  Starting RustyDroid container session...");
+                    match SessionManager::start_session() {
+                        Ok(pid) => println!("🟢 Container session started (PID: {})", pid),
+                        Err(e) => eprintln!("⚠️ Note starting session: {}", e),
+                    }
+                }
                 eprintln!("ℹ️  Wayland display socket not found (graphical runner skipped in headless/sandbox mode).");
                 return Ok(());
             }
 
-            match check_waydroid_runner_state() {
+            let runner_ready = match check_waydroid_runner_state() {
                 WaydroidRunnerState::NotInstalled | WaydroidRunnerState::NotInitialized => {
                     eprintln!("\n❌ Графический раннер Waydroid не установлен или не инициализирован!");
                     eprintln!("💡 Пакеты раннера и образы Android уже подготовлены локально.");
@@ -404,23 +498,35 @@ fn main() -> anyhow::Result<()> {
                         "RustyDroid: Требуется настройка раннера",
                         "Запустите `rustydroid setup-runner` для инициализации Waydroid",
                     );
+                    false
                 }
                 WaydroidRunnerState::Stopped => {
-                    println!("🔄 Запуск сессии Waydroid на рабочем столе (первый старт Android может занять до 30 сек)...");
+                    println!("🔄 Запуск сессии Waydroid на рабочем столе (первый старт Android может занять до 60 сек)...");
                     notify_desktop("RustyDroid", "Запуск сессии Android (подождите ~15–30 сек)...");
                     match start_waydroid_session_and_wait() {
-                        Ok(()) => {
-                            launch_in_waydroid(&target, &package, &display_name, is_apk)?;
-                        }
+                        Ok(()) => true,
                         Err(err) => {
                             eprintln!("\n❌ {}", err);
                             notify_desktop("RustyDroid: Служба не запущена", &err);
+                            false
                         }
                     }
                 }
-                WaydroidRunnerState::Running => {
-                    launch_in_waydroid(&target, &package, &display_name, is_apk)?;
+                WaydroidRunnerState::Running => true,
+            };
+
+            if runner_ready {
+                let serial = try_connect_waydroid_adb();
+                if let Some(ref insp) = maybe_inspection {
+                    install_bundle_adapted(insp, &profile, serial.as_deref())?;
                 }
+                launch_adapted_app(
+                    serial.as_deref(),
+                    &package,
+                    activity.as_deref(),
+                    &display_name,
+                    &profile,
+                )?;
             }
         }
 
@@ -482,7 +588,7 @@ fn main() -> anyhow::Result<()> {
             let adb_ok = AdbClient::is_adb_available();
             println!("  • ADB Tooling:        {}", if adb_ok { "Available ✅" } else { "Not found (optional) ⚠️" });
 
-            // 8. Waydroid Graphical Runner
+            // 8. Waydroid Graphical Runner & ARM Translation
             let runner_desc = match check_waydroid_runner_state() {
                 WaydroidRunnerState::NotInstalled => "Not installed ❌",
                 WaydroidRunnerState::NotInitialized => "Not initialized ⚠️ (run `rustydroid setup-runner`)",
@@ -490,6 +596,17 @@ fn main() -> anyhow::Result<()> {
                 WaydroidRunnerState::Running => "RUNNING 🟢",
             };
             println!("  • Graphical Runner:   {}", runner_desc);
+            let abis = rustydroid::runtime::adapt::detect_container_abis();
+            let arm_ok = rustydroid::apk::compat::container_supports_arm(&abis);
+            println!(
+                "  • Container ABIs:     {} ({})",
+                abis.join(", "),
+                if arm_ok {
+                    "ARM/ARM64 ready ✅"
+                } else {
+                    "x86 only ⚠️ run `rustydroid setup-arm`"
+                }
+            );
 
             // 9. Session Status
             let session_info = SessionManager::get_state();
@@ -506,6 +623,75 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
+        Commands::Adapt { action } => match action {
+            AdaptAction::Show { target } => {
+                let target = normalize_path_str(&target);
+                let is_apk = is_package_archive_path(&target);
+                if is_apk && !Path::new(&target).exists() {
+                    anyhow::bail!("Файл пакета не найден: {}", target);
+                }
+                let (_pkg, _act, _label, maybe_insp, profile) =
+                    inspect_target_or_package(&target, is_apk, &ProfileOverrides::default())?;
+                if let Some(insp) = maybe_insp {
+                    print_compatibility_report(&insp, &profile);
+                } else {
+                    let has_saved = ProfileStore::load(&profile.package_name).is_some();
+                    println!(
+                        "⚙️  Профиль адаптации для {} ({}):",
+                        profile.package_name,
+                        if has_saved { "сохранённый" } else { "по умолчанию" }
+                    );
+                    print_profile_fields(&profile);
+                }
+            }
+            AdaptAction::Set { target, flags } => {
+                let target = normalize_path_str(&target);
+                let is_apk = is_package_archive_path(&target);
+                let overrides = flags.to_overrides()?;
+                let (pkg, _act, _label, _maybe_insp, profile) =
+                    inspect_target_or_package(&target, is_apk, &overrides)?;
+                let path = ProfileStore::save(&profile)?;
+                println!("✅ Профиль для {} сохранён: {}", pkg, path.display());
+                print_profile_fields(&profile);
+            }
+            AdaptAction::Reset { package_name } => {
+                if ProfileStore::remove(&package_name)? {
+                    println!("🗑️  Сохранённый профиль для {} удалён.", package_name);
+                } else {
+                    println!("ℹ️  Профиль для {} не найден.", package_name);
+                }
+            }
+            AdaptAction::List => {
+                let profiles = ProfileStore::list_all();
+                if profiles.is_empty() {
+                    println!("ℹ️  Сохранённых per-app профилей адаптации пока нет.");
+                } else {
+                    println!("📋 Профили адаптации RustyDroid ({}):", profiles.len());
+                    for p in profiles {
+                        println!(
+                            "  • {} — mode={:?}, fake_wifi={}, fake_touch={}, installer={}",
+                            p.package_name,
+                            p.window_mode,
+                            p.fake_wifi,
+                            p.fake_touch,
+                            p.installer_spoof.as_deref().unwrap_or("none")
+                        );
+                    }
+                }
+            }
+        },
+
+        Commands::SetupArm => {
+            println!("🛠️  Установка слоя ARM/ARM64 трансляции (libndk_translation) для Waydroid...");
+            let Some(script) = find_arm_setup_script() else {
+                anyhow::bail!("Скрипт install-waydroid-arm-translation.sh не найден в ~/.local/bin/");
+            };
+            run_privileged_setup_script(
+                &script,
+                "✅ Слой ARM/ARM64 трансляции (libndk_translation) настроен!",
+            )?;
+        }
+
         Commands::Stop => {
             println!("🛑 Stopping RustyDroid session...");
             let was_running = SessionManager::is_running();
@@ -518,7 +704,11 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Shell { args } => {
-            if AdbClient::is_adb_available() {
+            if let Some(serial) = try_connect_waydroid_adb() {
+                let cmd_slice: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                let output = AdbClient::shell_for(&serial, &cmd_slice)?;
+                print!("{}", output);
+            } else if AdbClient::is_adb_available() && AdbClient::is_device_connected() {
                 let cmd_slice: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                 let output = AdbClient::shell_command(&cmd_slice)?;
                 print!("{}", output);
@@ -535,32 +725,10 @@ fn main() -> anyhow::Result<()> {
             let Some(script) = find_runner_setup_script() else {
                 anyhow::bail!("Скрипт установки install-waydroid-runner.sh не найден в ~/.local/bin/");
             };
-
-            use std::io::IsTerminal;
-            if std::io::stdin().is_terminal() {
-                let status = std::process::Command::new("sudo")
-                    .arg(&script)
-                    .status()?;
-                if status.success() {
-                    println!("✅ Раннер Waydroid настроен и запущен!");
-                } else {
-                    anyhow::bail!("Установка завершилась с ошибкой (код {:?})", status.code());
-                }
-            } else {
-                let cmd_str = format!(
-                    "sudo '{}'; echo ''; read -p 'Нажмите Enter для закрытия...'",
-                    script.display()
-                );
-                let spawned = std::process::Command::new("kitty")
-                    .args(&["-e", "bash", "-c", &cmd_str])
-                    .spawn();
-                if spawned.is_err() {
-                    let status = std::process::Command::new("pkexec").arg(&script).status()?;
-                    if !status.success() {
-                        anyhow::bail!("Установка через pkexec не завершена");
-                    }
-                }
-            }
+            run_privileged_setup_script(
+                &script,
+                "✅ Раннер Waydroid настроен и запущен!",
+            )?;
         }
 
         Commands::InternalBinderfs { path } => {
@@ -574,9 +742,39 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_privileged_setup_script(script: &Path, success_msg: &str) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        let status = std::process::Command::new("sudo")
+            .arg(script)
+            .status()?;
+        if status.success() {
+            println!("{}", success_msg);
+        } else {
+            anyhow::bail!("Установка завершилась с ошибкой (код {:?})", status.code());
+        }
+    } else {
+        let cmd_str = format!(
+            "sudo '{}'; echo ''; read -p 'Нажмите Enter для закрытия...'",
+            script.display()
+        );
+        let spawned = std::process::Command::new("kitty")
+            .args(&["-e", "bash", "-c", &cmd_str])
+            .spawn();
+        if spawned.is_err() {
+            let status = std::process::Command::new("pkexec").arg(script).status()?;
+            if !status.success() {
+                anyhow::bail!("Установка через pkexec не завершена");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustydroid::runtime::adapt::waydroid_text_has_error;
 
     #[test]
     fn test_normalize_file_uri_and_percent_decode() {

@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+pub mod adapt;
 pub mod config;
 pub mod images;
 pub mod session;
