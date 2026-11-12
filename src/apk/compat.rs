@@ -225,7 +225,7 @@ pub struct ProfileOverrides {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmInstallDiagnosis {
     pub error_code: Option<String>,
-    pub summary_ru: String,
+    pub summary: String,
     pub retry_with_downgrade: bool,
     pub retry_with_force_sdk: bool,
     pub retry_with_bypass_low_sdk: bool,
@@ -480,9 +480,9 @@ fn detect_bundle_format(path: &Path, has_xapk_json: bool, has_apkm_json: bool) -
 fn read_zip_entry_bytes<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str, max_bytes: usize) -> Result<Vec<u8>> {
     let mut entry = archive
         .by_name(name)
-        .with_context(|| format!("Запись '{}' не найдена в архиве", name))?;
+        .with_context(|| format!("Archive entry '{}' not found", name))?;
     if entry.size() as usize > max_bytes {
-        bail!("Файл '{}' слишком велик для чтения в память ({} байт)", name, entry.size());
+        bail!("Entry '{}' exceeds in-memory limit ({} bytes)", name, entry.size());
     }
     let mut buf = Vec::with_capacity(entry.size() as usize);
     entry.read_to_end(&mut buf)?;
@@ -538,7 +538,7 @@ fn inspect_bundle_archive(
 
     if apk_entries_raw.is_empty() {
         bail!(
-            "В архиве '{}' не найден AndroidManifest.xml и не обнаружены внутренние .apk файлы",
+            "Archive '{}' contains neither AndroidManifest.xml nor inner .apk files",
             source_path.display()
         );
     }
@@ -559,7 +559,6 @@ fn inspect_bundle_archive(
     let mut split_abis_collected: BTreeSet<String> = BTreeSet::new();
     let mut split_engines: Vec<String> = Vec::new();
 
-    // Order base-looking candidates first so we find the primary APK quickly.
     apk_entries_raw.sort_by_key(|(name, _)| {
         let fname = Path::new(name)
             .file_name()
@@ -581,7 +580,7 @@ fn inspect_bundle_archive(
     for (entry_name, size_bytes) in apk_entries_raw {
         let apk_bytes = read_zip_entry_bytes(archive, &entry_name, MAX_IN_MEMORY_BASE_APK_BYTES)?;
         let mut inner_zip = ZipArchive::new(Cursor::new(&apk_bytes))
-            .with_context(|| format!("Некорректный внутренний APK '{}'", entry_name))?;
+            .with_context(|| format!("Invalid inner APK '{}'", entry_name))?;
 
         let (split_attr, abis, engine) = peek_inner_apk(&mut inner_zip)?;
         for a in abis {
@@ -769,7 +768,7 @@ fn peek_inner_apk<R: Read + Seek>(
     inner: &mut ZipArchive<R>,
 ) -> Result<(Option<String>, Vec<String>, Option<String>)> {
     let manifest_bytes = read_zip_entry_bytes(inner, "AndroidManifest.xml", 16 * 1024 * 1024)
-        .context("Внутренний .apk не содержит AndroidManifest.xml")?;
+        .context("Inner .apk is missing AndroidManifest.xml")?;
     let mut parser = AxmlParser::new(&manifest_bytes);
     let root = parser.parse()?;
     let split_attr = root.get_attr("split", parser.string_pool());
@@ -1107,31 +1106,31 @@ fn build_compat_warnings(report: &ApkCompatibilityReport, _base_name: Option<&st
     } = report.abi_status
     {
         warnings.push(format!(
-            "ARM-only пакет ({}), а в Waydroid не активна ARM-трансляция — выполните `rustydroid setup-arm`.",
+            "ARM-only package ({}) and container ARM translation is disabled; run `rustydroid setup-arm`.",
             abis.join(", ")
         ));
     }
     if let Some(t) = report.target_sdk {
         if t < 23 {
             warnings.push(format!(
-                "Низкий targetSdkVersion ({}), на Android 13+ может потребоваться `--force-sdk`.",
+                "Low targetSdkVersion ({}); Android 13+ may require `--force-sdk`.",
                 t
             ));
         }
     }
     if report.uses_gms {
         warnings.push(
-            "Обнаружена зависимость от Google Play Services / Firebase (на VANILLA-образе Waydroid без microG/GApps часть функций может не работать).".to_string()
+            "Google Play Services / Firebase dependency detected (features may be degraded on VANILLA images without microG/GApps).".to_string()
         );
     }
     if !report.obb_files.is_empty() {
         warnings.push(format!(
-            "В комплекте {} OBB-файл(ов) кэша — RustyDroid автоматически развернёт их в /sdcard/Android/obb.",
+            "Includes {} OBB expansion file(s); will be staged to /sdcard/Android/obb.",
             report.obb_files.len()
         ));
     }
     if report.is_test_only {
-        warnings.push("Пакет помечен android:testOnly=true — установка будет выполнена с флагом `-t`.".to_string());
+        warnings.push("Package has android:testOnly=true; installation will pass `-t`.".to_string());
     }
     warnings
 }
@@ -1469,7 +1468,7 @@ pub fn stage_bundle_artifacts(
     for (idx, entry_name) in selected_entries.iter().enumerate() {
         let mut entry = archive
             .by_name(entry_name)
-            .with_context(|| format!("Отсутствует split APK '{}' в архиве", entry_name))?;
+            .with_context(|| format!("Missing split APK '{}' in archive", entry_name))?;
         let base_fname = Path::new(entry_name)
             .file_name()
             .and_then(|s| s.to_str())
@@ -1488,7 +1487,7 @@ pub fn stage_bundle_artifacts(
     for obb in &inspection.compat.obb_files {
         let mut entry = archive
             .by_name(&obb.entry_name)
-            .with_context(|| format!("Отсутствует OBB '{}' в архиве", obb.entry_name))?;
+            .with_context(|| format!("Missing OBB '{}' in archive", obb.entry_name))?;
         let obb_stage_dir = staging_dir.join("obb").join(&obb.package_name);
         fs::create_dir_all(&obb_stage_dir)?;
         let host_obb = obb_stage_dir.join(&obb.file_name);
@@ -1606,7 +1605,7 @@ pub fn classify_pm_install_failure(output: &str) -> PmInstallDiagnosis {
     if upper.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
         return PmInstallDiagnosis {
             error_code,
-            summary_ru: "Установлена более новая версия пакета (downgrade).".to_string(),
+            summary: "Newer version already installed (downgrade).".to_string(),
             retry_with_downgrade: true,
             retry_with_force_sdk: false,
             retry_with_bypass_low_sdk: false,
@@ -1619,7 +1618,7 @@ pub fn classify_pm_install_failure(output: &str) -> PmInstallDiagnosis {
     {
         return PmInstallDiagnosis {
             error_code,
-            summary_ru: "Устаревший targetSdkVersion блокируется Android без флага совместимости.".to_string(),
+            summary: "Deprecated targetSdkVersion blocked by Android without compatibility flag.".to_string(),
             retry_with_downgrade: false,
             retry_with_force_sdk: true,
             retry_with_bypass_low_sdk: true,
@@ -1630,7 +1629,7 @@ pub fn classify_pm_install_failure(output: &str) -> PmInstallDiagnosis {
     if upper.contains("INSTALL_FAILED_NO_MATCHING_ABIS") {
         return PmInstallDiagnosis {
             error_code,
-            summary_ru: "Нет совместимых нативных библиотек (ABI) в контейнере. Проверьте `rustydroid setup-arm` или флаг `--abi`.".to_string(),
+            summary: "No matching native ABIs in container. Run `rustydroid setup-arm` or pass `--abi`.".to_string(),
             retry_with_downgrade: false,
             retry_with_force_sdk: false,
             retry_with_bypass_low_sdk: false,
@@ -1641,7 +1640,7 @@ pub fn classify_pm_install_failure(output: &str) -> PmInstallDiagnosis {
     if upper.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || upper.contains("INSTALL_FAILED_SHARED_USER_INCOMPATIBLE") {
         return PmInstallDiagnosis {
             error_code,
-            summary_ru: "Конфликт цифровой подписи с уже установленным приложением (удалите старую версию через `adb uninstall`).".to_string(),
+            summary: "Signature mismatch with already installed package (remove old version via `adb uninstall`).".to_string(),
             retry_with_downgrade: false,
             retry_with_force_sdk: false,
             retry_with_bypass_low_sdk: false,
@@ -1652,7 +1651,7 @@ pub fn classify_pm_install_failure(output: &str) -> PmInstallDiagnosis {
     if upper.contains("INSTALL_FAILED_TEST_ONLY") {
         return PmInstallDiagnosis {
             error_code,
-            summary_ru: "Тестовая сборка (android:testOnly=true) требует флаг `-t`.".to_string(),
+            summary: "Test-only package (android:testOnly=true) requires `-t`.".to_string(),
             retry_with_downgrade: false,
             retry_with_force_sdk: false,
             retry_with_bypass_low_sdk: false,
@@ -1663,7 +1662,7 @@ pub fn classify_pm_install_failure(output: &str) -> PmInstallDiagnosis {
     if upper.contains("INSTALL_FAILED_MISSING_SHARED_LIBRARY") {
         return PmInstallDiagnosis {
             error_code,
-            summary_ru: "Пакет требует отсутствующую системную библиотеку (например, Google Maps / Play library).".to_string(),
+            summary: "Missing required shared system library (e.g. Google Maps / Play library).".to_string(),
             retry_with_downgrade: false,
             retry_with_force_sdk: false,
             retry_with_bypass_low_sdk: false,
@@ -1674,7 +1673,7 @@ pub fn classify_pm_install_failure(output: &str) -> PmInstallDiagnosis {
     if upper.contains("INSTALL_FAILED_PERMISSION_MODEL_DOWNGRADE") || upper.contains("SECURITYEXCEPTION") && upper.contains("GRANT") {
         return PmInstallDiagnosis {
             error_code,
-            summary_ru: "Ограничение выдачи runtime-разрешений при установке, повторяем без `-g`.".to_string(),
+            summary: "Runtime permission auto-grant rejected during install; retrying without `-g`.".to_string(),
             retry_with_downgrade: false,
             retry_with_force_sdk: false,
             retry_with_bypass_low_sdk: false,
@@ -1684,7 +1683,7 @@ pub fn classify_pm_install_failure(output: &str) -> PmInstallDiagnosis {
 
     PmInstallDiagnosis {
         error_code,
-        summary_ru: format!("Ошибка установки Android PackageManager: {}", output.trim()),
+        summary: format!("Android PackageManager install error: {}", output.trim()),
         retry_with_downgrade: false,
         retry_with_force_sdk: false,
         retry_with_bypass_low_sdk: false,
@@ -1769,6 +1768,6 @@ mod tests {
 
         let abi = classify_pm_install_failure("Failure [INSTALL_FAILED_NO_MATCHING_ABIS: Failed to extract native libraries]");
         assert!(!abi.retry_with_downgrade);
-        assert!(abi.summary_ru.contains("setup-arm"));
+        assert!(abi.summary.contains("setup-arm"));
     }
 }

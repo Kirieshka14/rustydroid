@@ -253,7 +253,7 @@ impl AdbClient {
                 updated.push_str(pubkey_line);
                 updated.push('\n');
                 fs::write(&keys_file, updated)
-                    .with_context(|| format!("Не удалось записать {}", keys_file.display()))?;
+                    .with_context(|| format!("Failed to write {}", keys_file.display()))?;
                 let _ = fs::set_permissions(&keys_file, Permissions::from_mode(0o640));
             }
         }
@@ -278,10 +278,9 @@ impl AdbClient {
         }
     }
 
-    /// Connects ADB cleanly to the target Waydroid `<ip>:5555` endpoint without touching physical USB devices.
     pub fn connect_target(serial: &str) -> Result<()> {
         if !Self::is_adb_available() {
-            bail!("adb не найден в PATH");
+            bail!("adb not found in PATH");
         }
         Self::unfreeze_waydroid_container();
         let _ = Self::ensure_waydroid_adb_authorized(&Self::waydroid_data_dir());
@@ -305,14 +304,13 @@ impl AdbClient {
             return Ok(());
         }
         bail!(
-            "ADB не удалось подключиться к {} (state='{}', details='{}')",
+            "Failed to connect ADB to {} (state='{}', details='{}')",
             serial,
             state_str,
             conn_text.trim()
         )
     }
 
-    /// Builds `adb install` or `adb install-multiple` argument vector uniformly.
     pub fn build_adb_install_args(
         serial: &str,
         apk_paths: &[PathBuf],
@@ -359,14 +357,13 @@ impl AdbClient {
         args
     }
 
-    /// Installs one or multiple (split) APKs via targeted ADB with automatic recovery retries.
     pub fn install_with_adaptation(
         serial: &str,
         apk_paths: &[PathBuf],
         base_opts: &InstallOptions,
     ) -> Result<InstallOutcome> {
         if apk_paths.is_empty() {
-            bail!("Нет APK файлов для установки");
+            bail!("No APK files to install");
         }
         Self::unfreeze_waydroid_container();
 
@@ -380,7 +377,7 @@ impl AdbClient {
                 .args(&args)
                 .stdin(Stdio::null())
                 .output()
-                .context("Не удалось выполнить adb install")?;
+                .context("Failed to run adb install")?;
 
             let combined = format!(
                 "{}\n{}",
@@ -419,10 +416,9 @@ impl AdbClient {
                 if diag.retry_without_grant && opts.grant_permissions {
                     opts.grant_permissions = false;
                     fallback_notes.push("without-g".to_string());
-                    warnings.push(diag.summary_ru);
+                    warnings.push(diag.summary);
                     continue;
                 }
-                // Some adb/Android builds reject `--force-sdk` or `-i` syntax on `install` -> fallback cleanly
                 if (combined.contains("Unknown option --force-sdk")
                     || combined.contains("Unknown option --bypass-low-target-sdk-block"))
                     && (opts.force_sdk || opts.bypass_low_target_sdk_block)
@@ -437,13 +433,12 @@ impl AdbClient {
                 }
             }
 
-            bail!("{}", diag.summary_ru);
+            bail!("{}", diag.summary);
         }
 
-        bail!("Не удалось установить пакет после повторных попыток")
+        bail!("Package installation failed after retries")
     }
 
-    /// Uninstalls a package from the targeted ADB device/container cleanly.
     pub fn uninstall_target(serial: &str, package_name: &str) -> Result<()> {
         Self::unfreeze_waydroid_container();
         let out = Self::run_adb_with_timeout(&["-s", serial, "uninstall", package_name], 30)?;
@@ -453,12 +448,11 @@ impl AdbClient {
             String::from_utf8_lossy(&out.stderr)
         );
         if !out.status.success() && !combined.contains("Unknown package") {
-            bail!("Ошибка удаления {}: {}", package_name, combined.trim());
+            bail!("Failed to uninstall {}: {}", package_name, combined.trim());
         }
         Ok(())
     }
 
-    /// Pushes `.obb` expansion files cleanly to `/sdcard/Android/obb/<pkg>/`.
     pub fn push_obb_files(serial: &str, obb_mappings: &[(PathBuf, String)]) -> Result<()> {
         Self::unfreeze_waydroid_container();
         for (host_file, remote_path) in obb_mappings {
@@ -476,7 +470,7 @@ impl AdbClient {
             )?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                bail!("Ошибка копирования OBB {}: {}", remote_path, err.trim());
+                bail!("Failed to push OBB {}: {}", remote_path, err.trim());
             }
         }
         Ok(())
@@ -590,7 +584,7 @@ impl AdbClient {
             ],
         )?;
         if out.contains("No activities found") {
-            bail!("Не найдена LAUNCHER Activity для пакета {}", package);
+            bail!("No LAUNCHER activity found for {}", package);
         }
         Ok(())
     }
