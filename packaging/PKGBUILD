@@ -1,0 +1,47 @@
+pkgname=rustydroid
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Waydroid-based Android APK, XAPK, APKS, and APKM runner with Hyprland window sync"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Kirieshka14/rustydroid"
+license=('MIT')
+depends=('waydroid' 'android-tools' 'python' 'curl' 'unzip')
+optdepends=(
+    'libnotify: desktop notifications'
+    'hyprland: automatic window resizing via socket2'
+    'bubblewrap: fallback namespace shell'
+)
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm755 "packaging/install-waydroid-runner.sh" "$pkgdir/usr/share/$pkgname/install-waydroid-runner.sh"
+    install -Dm755 "packaging/install-waydroid-arm-translation.sh" "$pkgdir/usr/share/$pkgname/install-waydroid-arm-translation.sh"
+    install -Dm644 "packaging/rustydroid.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
+    install -Dm644 "packaging/rustydroid-android-bundles.xml" "$pkgdir/usr/share/mime/packages/$pkgname-android-bundles.xml"
+    install -Dm644 "packaging/rustydroid-servicemenu.desktop" "$pkgdir/usr/share/kio/servicemenus/$pkgname.desktop"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

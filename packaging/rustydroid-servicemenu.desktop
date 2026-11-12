@@ -1,0 +1,35 @@
+[Desktop Entry]
+Type=Service
+MimeType=application/vnd.android.package-archive;application/vnd.android.xapk;application/vnd.android.apks;application/vnd.android.apkm;
+Actions=RunApk;RunPortrait;InstallApk;InfoApk;SetupArm;SetupRunner;
+X-KDE-Priority=TopLevel
+
+[Desktop Action RunApk]
+Name=Run with RustyDroid
+Icon=system-run
+Exec=rustydroid run %f
+
+[Desktop Action RunPortrait]
+Name=Run in Phone Portrait Mode (RustyDroid)
+Icon=smartphone
+Exec=rustydroid run --window-mode portrait %f
+
+[Desktop Action InstallApk]
+Name=Install to Application Menu (RustyDroid)
+Icon=system-software-install
+Exec=rustydroid install %f
+
+[Desktop Action InfoApk]
+Name=Inspect Package Info (RustyDroid)
+Icon=dialog-information
+Exec=rustydroid info %f
+
+[Desktop Action SetupArm]
+Name=Setup ARM/ARM64 Translation (libndk)
+Icon=cpu
+Exec=rustydroid setup-arm
+
+[Desktop Action SetupRunner]
+Name=Setup Waydroid Runner (RustyDroid)
+Icon=configure
+Exec=rustydroid setup-runner

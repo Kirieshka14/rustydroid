@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=RustyDroid
+GenericName=Android APK / Bundle Runner
+Comment=Run Android APK, XAPK, APKS, and APKM files via Waydroid
+Exec=rustydroid run %f
+Icon=android
+Terminal=false
+MimeType=application/vnd.android.package-archive;application/vnd.android.xapk;application/vnd.android.apks;application/vnd.android.apkm;
+Categories=Utility;System;Emulator;
+Keywords=apk;xapk;apks;apkm;android;waydroid;runner;
+StartupNotify=true
+Actions=Install;Info;
+
+[Desktop Action Install]
+Name=Install Desktop Shortcut (RustyDroid)
+Exec=rustydroid install %f
+
+[Desktop Action Info]
+Name=Inspect Package Info (RustyDroid)
+Exec=rustydroid info %f
