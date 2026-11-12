@@ -7,8 +7,9 @@ use rustydroid::apk::DesktopIntegration;
 use rustydroid::binder::BinderManager;
 use rustydroid::container::{ContainerConfig, MountManager, NamespaceManager};
 use rustydroid::runtime::adapt::{
-    find_arm_setup_script, inspect_target_or_package, install_bundle_adapted, launch_adapted_app,
-    print_compatibility_report, print_profile_fields, try_connect_waydroid_adb,
+    detect_waydroid_gralloc_diagnostic, find_arm_setup_script, inspect_target_or_package,
+    install_bundle_adapted, launch_adapted_app, print_compatibility_report, print_profile_fields,
+    try_connect_waydroid_adb, try_connect_waydroid_adb_with_retry,
 };
 use rustydroid::runtime::{ConfigManager, ImageManager, SessionManager};
 use std::path::{Path, PathBuf};
@@ -287,6 +288,65 @@ fn notify_desktop(title: &str, body: &str) {
         .status();
 }
 
+fn read_waydroid_session_error(log_path: &Path) -> String {
+    let log_content = std::fs::read_to_string(log_path).unwrap_or_default();
+    if log_content.contains("WayDroid container is not listening") {
+        return "Служба контейнера Waydroid (waydroid-container) не запущена.\n👉 Запустите: sudo systemctl start waydroid-container".to_string();
+    }
+    let summary = log_content
+        .lines()
+        .last()
+        .unwrap_or("Процесс сессии завершился")
+        .to_string();
+    format!("Сессия Waydroid завершилась с ошибкой: {}", summary)
+}
+
+fn is_systemd_user_unit_failed(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-failed", "--quiet", unit])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn wait_for_android_boot_ready(
+    mut child: Option<&mut std::process::Child>,
+    via_systemd: bool,
+    log_path: Option<&Path>,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    if rustydroid::runtime::adapt::is_android_user_ready() {
+        return Ok(());
+    }
+
+    println!("⏳ Ожидание полной загрузки Android (sys.boot_completed=1)...");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if let Some(ref mut c) = child {
+            if let Ok(Some(_)) = c.try_wait() {
+                let err = log_path
+                    .map(read_waydroid_session_error)
+                    .unwrap_or_else(|| "Сессия Waydroid завершилась во время загрузки Android.".to_string());
+                return Err(err);
+            }
+        }
+        if via_systemd && is_systemd_user_unit_failed("rustydroid-waydroid-session") {
+            return Err("Юнит systemd `rustydroid-waydroid-session` завершился с ошибкой. Проверьте `journalctl --user -u rustydroid-waydroid-session`.".to_string());
+        }
+        if check_waydroid_runner_state() == WaydroidRunnerState::Stopped {
+            return Err("Сессия Waydroid остановилась во время загрузки Android (проверьте `waydroid status` и `journalctl`).".to_string());
+        }
+        AdbClient::unfreeze_waydroid_container();
+        if rustydroid::runtime::adapt::is_android_user_ready() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(750));
+    }
+
+    Err("Превышено время ожидания загрузки Android внутри Waydroid (`sys.boot_completed != 1`). Проверьте `waydroid status` и `journalctl`.".to_string())
+}
+
 fn start_waydroid_session_and_wait() -> Result<(), String> {
     let log_dir = ConfigManager::get_data_dir();
     let _ = std::fs::create_dir_all(&log_dir);
@@ -346,24 +406,28 @@ fn start_waydroid_session_and_wait() -> Result<(), String> {
         None
     };
 
-    for _ in 0..120 {
+    let mut session_running = false;
+    for _ in 0..60 {
         if let Some(ref mut c) = child {
             if let Ok(Some(_)) = c.try_wait() {
-                let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
-                if log_content.contains("WayDroid container is not listening") {
-                    return Err("Служба контейнера Waydroid (waydroid-container) не запущена.\n👉 Запустите: sudo systemctl start waydroid-container".to_string());
-                }
-                let summary = log_content.lines().last().unwrap_or("Процесс сессии завершился").to_string();
-                return Err(format!("Сессия Waydroid завершилась с ошибкой: {}", summary));
+                return Err(read_waydroid_session_error(&log_path));
             }
         }
+        if launched_via_systemd && is_systemd_user_unit_failed("rustydroid-waydroid-session") {
+            return Err("Юнит systemd `rustydroid-waydroid-session` не запустился. Проверьте `journalctl --user -u rustydroid-waydroid-session`.".to_string());
+        }
         if check_waydroid_runner_state() == WaydroidRunnerState::Running {
-            return Ok(());
+            session_running = true;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    Err("Превышено время ожидания запуска сессии Waydroid (проверьте `waydroid status`).".to_string())
+    if !session_running {
+        return Err("Превышено время ожидания запуска сессии Waydroid (проверьте `waydroid status`).".to_string());
+    }
+
+    wait_for_android_boot_ready(child.as_mut(), launched_via_systemd, Some(&log_path), 90)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -522,36 +586,41 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let runner_ready = match check_waydroid_runner_state() {
+            match check_waydroid_runner_state() {
                 WaydroidRunnerState::NotInstalled | WaydroidRunnerState::NotInitialized => {
-                    eprintln!("\n❌ Графический раннер Waydroid не установлен или не инициализирован!");
-                    eprintln!("💡 Пакеты раннера и образы Android уже подготовлены локально.");
-                    eprintln!("👉 Для одноразовой настройки (установка из кэша + init + запуск службы) выполните:");
-                    eprintln!("     rustydroid setup-runner");
-
-                    notify_desktop(
-                        "RustyDroid: Требуется настройка раннера",
-                        "Запустите `rustydroid setup-runner` для инициализации Waydroid",
-                    );
-                    false
+                    let msg = "Графический раннер Waydroid не установлен или не инициализирован. Выполните `rustydroid setup-runner`.";
+                    eprintln!("\n❌ {}", msg);
+                    notify_desktop("RustyDroid: Требуется настройка раннера", msg);
+                    anyhow::bail!("{}", msg);
                 }
                 WaydroidRunnerState::Stopped => {
                     println!("🔄 Запуск сессии Waydroid на рабочем столе (первый старт Android может занять до 60 сек)...");
-                    notify_desktop("RustyDroid", "Запуск сессии Android (подождите ~15–30 сек)...");
-                    match start_waydroid_session_and_wait() {
-                        Ok(()) => true,
-                        Err(err) => {
-                            eprintln!("\n❌ {}", err);
-                            notify_desktop("RustyDroid: Служба не запущена", &err);
-                            false
-                        }
+                    notify_desktop("RustyDroid", "Запуск сессии Android (подождите ~15–45 сек)...");
+                    if let Err(err) = start_waydroid_session_and_wait() {
+                        eprintln!("\n❌ {}", err);
+                        notify_desktop("RustyDroid: Служба не запущена", &err);
+                        anyhow::bail!("{}", err);
                     }
                 }
-                WaydroidRunnerState::Running => true,
-            };
+                WaydroidRunnerState::Running => {
+                    if let Err(err) = wait_for_android_boot_ready(None, false, None, 90) {
+                        eprintln!("\n❌ {}", err);
+                        notify_desktop("RustyDroid: Android не готов", &err);
+                        anyhow::bail!("{}", err);
+                    }
+                }
+            }
 
-            if runner_ready {
-                let serial = try_connect_waydroid_adb();
+            let gralloc_diag = detect_waydroid_gralloc_diagnostic(true);
+            if gralloc_diag.is_mismatch() {
+                let msg = gralloc_diag.remediation_message();
+                eprintln!("\n❌ {}", msg);
+                notify_desktop("RustyDroid: Ошибка графики Waydroid (gralloc)", &msg);
+                anyhow::bail!("{}", msg);
+            }
+
+            let serial = try_connect_waydroid_adb_with_retry(6, 1000);
+            let launch_result: anyhow::Result<()> = (|| {
                 if let Some(ref insp) = maybe_inspection {
                     install_bundle_adapted(insp, &profile, serial.as_deref())?;
                 }
@@ -562,6 +631,13 @@ fn main() -> anyhow::Result<()> {
                     &display_name,
                     &profile,
                 )?;
+                Ok(())
+            })();
+
+            if let Err(err) = launch_result {
+                let err_text = format!("{}", err);
+                notify_desktop("RustyDroid: Ошибка запуска приложения", &err_text);
+                return Err(err);
             }
         }
 
@@ -624,13 +700,29 @@ fn main() -> anyhow::Result<()> {
             println!("  • ADB Tooling:        {}", if adb_ok { "Available ✅" } else { "Not found (optional) ⚠️" });
 
             // 8. Waydroid Graphical Runner & ARM Translation
-            let runner_desc = match check_waydroid_runner_state() {
+            let runner_state = check_waydroid_runner_state();
+            let runner_desc = match runner_state {
                 WaydroidRunnerState::NotInstalled => "Not installed ❌",
                 WaydroidRunnerState::NotInitialized => "Not initialized ⚠️ (run `rustydroid setup-runner`)",
                 WaydroidRunnerState::Stopped => "Initialized, session STOPPED ⚪",
                 WaydroidRunnerState::Running => "RUNNING 🟢",
             };
             println!("  • Graphical Runner:   {}", runner_desc);
+            let gralloc_diag =
+                detect_waydroid_gralloc_diagnostic(runner_state == WaydroidRunnerState::Running);
+            let gralloc_label = gralloc_diag
+                .runtime_gralloc
+                .as_deref()
+                .or(gralloc_diag.base_prop_gralloc.as_deref())
+                .unwrap_or("unknown");
+            if gralloc_diag.is_mismatch() {
+                println!(
+                    "  • Graphics Gralloc:   {} ⚠️  (mismatch с minigbm_gbm_mesa! Требуется minigbm_gbm_mesa)",
+                    gralloc_label
+                );
+            } else {
+                println!("  • Graphics Gralloc:   {} ✅", gralloc_label);
+            }
             let abis = rustydroid::runtime::adapt::detect_container_abis();
             let arm_ok = rustydroid::apk::compat::container_supports_arm(&abis);
             println!(
@@ -764,6 +856,15 @@ fn main() -> anyhow::Result<()> {
                 &script,
                 "✅ Раннер Waydroid настроен и запущен!",
             )?;
+            let diag = detect_waydroid_gralloc_diagnostic(false);
+            if diag.base_prop_gralloc.as_deref() == Some("gbm")
+                && !diag.legacy_gbm_enabled
+                && diag.cfg_prop_gralloc.as_deref() != Some("minigbm_gbm_mesa")
+            {
+                eprintln!("\n⚠️  Примечание: в `waydroid_base.prop` прописано `ro.hardware.gralloc=gbm`.");
+                eprintln!("   Если Android 13 образ использует `minigbm_gbm_mesa`, добавьте `ro.hardware.gralloc = minigbm_gbm_mesa`");
+                eprintln!("   в [properties] файла `/var/lib/waydroid/waydroid.cfg` и выполните `sudo waydroid upgrade -o`.");
+            }
         }
 
         Commands::InternalBinderfs { path } => {

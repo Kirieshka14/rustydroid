@@ -382,17 +382,232 @@ fn fallback_waydroid_install(apk_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Parses `key=val` properties from an Android `.prop` file.
+pub fn parse_prop_value(content: &str, key: &str) -> Option<String> {
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parses `key = val` inside a given `[section]` of an INI file (`waydroid.cfg`).
+pub fn parse_ini_property(content: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let current = line[1..line.len() - 1].trim();
+            in_section = current == section;
+            continue;
+        }
+        if in_section {
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim() == key {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Inserts or updates a property under `[properties]` in `waydroid.cfg` text.
+pub fn ensure_cfg_property(cfg_content: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = cfg_content.lines().map(ToString::to_string).collect();
+    let mut in_props = false;
+    let mut props_header_idx = None;
+    let mut existing_idx = None;
+    let mut section_end_idx = lines.len();
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_props {
+                section_end_idx = idx;
+                break;
+            }
+            if trimmed[1..trimmed.len() - 1].trim() == "properties" {
+                in_props = true;
+                props_header_idx = Some(idx);
+            }
+            continue;
+        }
+        if in_props && !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with(';') {
+            if let Some((k, _)) = trimmed.split_once('=') {
+                if k.trim() == key {
+                    existing_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+    }
+
+    let formatted = format!("{} = {}", key, value);
+    if let Some(idx) = existing_idx {
+        lines[idx] = formatted;
+    } else if props_header_idx.is_some() {
+        lines.insert(section_end_idx, formatted);
+    } else {
+        if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(true) {
+            lines.push(String::new());
+        }
+        lines.push("[properties]".to_string());
+        lines.push(formatted);
+    }
+
+    let mut out = lines.join("\n");
+    if cfg_content.ends_with('\n') || !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrallocDiagnostic {
+    pub base_prop_gralloc: Option<String>,
+    pub cfg_prop_gralloc: Option<String>,
+    pub runtime_gralloc: Option<String>,
+    pub legacy_gbm_enabled: bool,
+    pub minigbm_allocator_running: bool,
+}
+
+impl GrallocDiagnostic {
+    /// True when Waydroid passes `ro.hardware.gralloc=gbm` to an image using `minigbm_gbm_mesa`,
+    /// causing `hwcomposer` / compositor `error 5: x/y < 1` crashes on Hyprland/Wayland.
+    pub fn is_mismatch(&self) -> bool {
+        if self.legacy_gbm_enabled {
+            return false;
+        }
+        let active_is_gbm = self.runtime_gralloc.as_deref() == Some("gbm")
+            || self.base_prop_gralloc.as_deref() == Some("gbm");
+        let cfg_fixed = self.cfg_prop_gralloc.as_deref() == Some("minigbm_gbm_mesa");
+        active_is_gbm && (!cfg_fixed || self.runtime_gralloc.as_deref() == Some("gbm")) && self.minigbm_allocator_running
+    }
+
+    pub fn remediation_message(&self) -> String {
+        "Обнаружено несоответствие графического аллокатора Waydroid: `ro.hardware.gralloc=gbm` при активном `minigbm_gbm_mesa` вызывает краш окна на Hyprland (x/y < 1).\n👉 Добавьте `ro.hardware.gralloc = minigbm_gbm_mesa` в секцию `[properties]` файла `/var/lib/waydroid/waydroid.cfg` и выполните:\n     sudo waydroid upgrade -o && sudo systemctl restart waydroid-container".to_string()
+    }
+}
+
+pub fn inspect_gralloc_from_sources(
+    base_prop: Option<&str>,
+    cfg_content: Option<&str>,
+    runtime_gralloc: Option<&str>,
+    minigbm_allocator_running: bool,
+) -> GrallocDiagnostic {
+    let base_prop_gralloc = base_prop.and_then(|c| parse_prop_value(c, "ro.hardware.gralloc"));
+    let legacy_gbm_enabled = base_prop
+        .and_then(|c| parse_prop_value(c, "gralloc.gbm.legacy"))
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let cfg_prop_gralloc = cfg_content.and_then(|c| parse_ini_property(c, "properties", "ro.hardware.gralloc"));
+
+    GrallocDiagnostic {
+        base_prop_gralloc,
+        cfg_prop_gralloc,
+        runtime_gralloc: runtime_gralloc.map(ToString::to_string),
+        legacy_gbm_enabled,
+        minigbm_allocator_running,
+    }
+}
+
+fn is_proc_binary_running(binary_suffix: &str) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(raw) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv0 = raw.split(|&b| b == 0).next().unwrap_or(&[]);
+        if let Ok(cmd) = std::str::from_utf8(argv0) {
+            if cmd == binary_suffix || cmd.ends_with(binary_suffix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Checks `/var/lib/waydroid/{waydroid_base.prop,waydroid.cfg}` and runtime properties for gralloc mismatch.
+pub fn detect_waydroid_gralloc_diagnostic(include_runtime_prop: bool) -> GrallocDiagnostic {
+    let base_prop = fs::read_to_string("/var/lib/waydroid/waydroid_base.prop").ok();
+    let cfg_content = fs::read_to_string("/var/lib/waydroid/waydroid.cfg").ok();
+    let runtime_gralloc = if include_runtime_prop {
+        waydroid_prop_get_quiet("ro.hardware.gralloc")
+    } else {
+        None
+    };
+    let minigbm_running =
+        is_proc_binary_running("/android.hardware.graphics.allocator@4.0-service.minigbm_gbm_mesa");
+
+    inspect_gralloc_from_sources(
+        base_prop.as_deref(),
+        cfg_content.as_deref(),
+        runtime_gralloc.as_deref(),
+        minigbm_running,
+    )
+}
+
+/// Evaluates whether Android has finished booting and User 0 storage is unlocked cleanly.
+pub fn parse_boot_readiness(boot_completed: Option<&str>, ce_available: Option<&str>) -> bool {
+    if boot_completed.map(str::trim) != Some("1") {
+        return false;
+    }
+    !matches!(ce_available.map(str::trim), Some("false") | Some("0"))
+}
+
+/// Returns true when Waydroid's `IPlatform` service responds with `sys.boot_completed=1`.
+pub fn is_android_user_ready() -> bool {
+    let boot = waydroid_prop_get_quiet("sys.boot_completed");
+    if boot.as_deref().map(str::trim) != Some("1") {
+        return false;
+    }
+    let ce = waydroid_prop_get_quiet("sys.user.0.ce_available");
+    parse_boot_readiness(boot.as_deref(), ce.as_deref())
+}
+
 /// Connects to Waydroid ADB endpoint if available, returning `Some("<ip>:5555")` cleanly.
 pub fn try_connect_waydroid_adb() -> Option<String> {
+    try_connect_waydroid_adb_with_retry(1, 0)
+}
+
+/// Connects to Waydroid ADB endpoint with bounded retries (useful right after Android finishes booting).
+pub fn try_connect_waydroid_adb_with_retry(attempts: u32, delay_ms: u64) -> Option<String> {
     if !AdbClient::is_adb_available() {
         return None;
     }
-    let ip = AdbClient::detect_waydroid_ip();
-    let serial = format!("{}:5555", ip);
-    match AdbClient::connect_target(&serial) {
-        Ok(()) => Some(serial),
-        Err(_) => None,
+    let tries = attempts.max(1);
+    for idx in 0..tries {
+        AdbClient::unfreeze_waydroid_container();
+        let ip = AdbClient::detect_waydroid_ip();
+        let serial = format!("{}:5555", ip);
+        if AdbClient::connect_target(&serial).is_ok() {
+            return Some(serial);
+        }
+        if idx + 1 < tries && delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
     }
+    None
 }
 
 fn is_waydroid_dbus_session_active() -> bool {
@@ -414,6 +629,17 @@ fn is_waydroid_dbus_session_active() -> bool {
         .unwrap_or(false)
 }
 
+fn is_package_installed_via_adb(serial: &str, package: &str) -> Option<bool> {
+    let out = AdbClient::shell_for(serial, &["pm", "path", package]).ok()?;
+    if out.contains("package:") {
+        Some(true)
+    } else if out.trim().is_empty() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Launches an installed Android app using `waydroid app launch` with ADB Activity fallback.
 pub fn launch_adapted_app(
     serial: Option<&str>,
@@ -422,6 +648,17 @@ pub fn launch_adapted_app(
     display_name: &str,
     profile: &AdaptationProfile,
 ) -> Result<()> {
+    AdbClient::unfreeze_waydroid_container();
+
+    if let Some(ser) = serial {
+        if let Some(false) = is_package_installed_via_adb(ser, package) {
+            bail!(
+                "Пакет {} не установлен в контейнере Waydroid.\n👉 Установите APK командой: rustydroid run /путь/к/файлу.apk",
+                package
+            );
+        }
+    }
+
     apply_runtime_profile(serial, profile);
 
     println!("🚀 Запуск окна приложения: {} ({}) ...", display_name, package);
@@ -432,6 +669,7 @@ pub fn launch_adapted_app(
         }
     }
 
+    AdbClient::unfreeze_waydroid_container();
     let launch_out = Command::new("waydroid")
         .args(["app", "launch", package])
         .output()
@@ -622,5 +860,45 @@ mod tests {
         let x86_only = detect_container_abis_from_paths(Some(&missing_prop), Some(&dir.path().join("none.so")));
         assert!(!container_supports_arm(&x86_only));
         assert_eq!(x86_only, vec!["x86_64", "x86"]);
+    }
+
+    #[test]
+    fn test_gralloc_mismatch_detection_and_cfg_update() {
+        let base_gbm = "sys.use_memfd=true\nro.hardware.gralloc=gbm\n";
+        let cfg_empty = "[waydroid]\narch = x86_64\n\n[properties]\nro.vndk.lite = true\n";
+        let diag_mismatch =
+            inspect_gralloc_from_sources(Some(base_gbm), Some(cfg_empty), Some("gbm"), true);
+        assert!(diag_mismatch.is_mismatch());
+
+        // Legacy flag suppresses mismatch warning
+        let base_legacy = "ro.hardware.gralloc=gbm\ngralloc.gbm.legacy=true\n";
+        let diag_legacy =
+            inspect_gralloc_from_sources(Some(base_legacy), Some(cfg_empty), Some("gbm"), true);
+        assert!(!diag_legacy.is_mismatch());
+
+        // Fixing waydroid.cfg + base_prop clears mismatch
+        let updated_cfg = ensure_cfg_property(cfg_empty, "ro.hardware.gralloc", "minigbm_gbm_mesa");
+        assert_eq!(
+            parse_ini_property(&updated_cfg, "properties", "ro.hardware.gralloc").as_deref(),
+            Some("minigbm_gbm_mesa")
+        );
+        let base_fixed = "sys.use_memfd=true\nro.hardware.gralloc=minigbm_gbm_mesa\n";
+        let diag_ok = inspect_gralloc_from_sources(
+            Some(base_fixed),
+            Some(&updated_cfg),
+            Some("minigbm_gbm_mesa"),
+            true,
+        );
+        assert!(!diag_ok.is_mismatch());
+    }
+
+    #[test]
+    fn test_parse_boot_readiness() {
+        assert!(!parse_boot_readiness(None, None));
+        assert!(!parse_boot_readiness(Some("0"), Some("true")));
+        assert!(!parse_boot_readiness(Some("1"), Some("false")));
+        assert!(!parse_boot_readiness(Some("1"), Some("0")));
+        assert!(parse_boot_readiness(Some("1"), Some("true")));
+        assert!(parse_boot_readiness(Some("1\n"), None));
     }
 }
