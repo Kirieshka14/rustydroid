@@ -485,7 +485,7 @@ fn test_cli_adapt_workflow_and_bundle_sandbox_e2e() {
         .run_cli(&["adapt", "reset", "org.rustydroid.adaptcli"])
         .unwrap();
     assert!(reset_status.success());
-    assert!(reset_out.contains("удалён"));
+    assert!(reset_out.contains("Removed"));
 
     // Clean up supervisor daemon started by headless `run`
     let (stop_status, _, _) = sandbox.run_cli(&["stop"]).unwrap();

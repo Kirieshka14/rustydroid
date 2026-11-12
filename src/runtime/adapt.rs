@@ -187,24 +187,23 @@ pub fn apply_runtime_profile(serial: Option<&str>, profile: &AdaptationProfile) 
     let vk_enabled = resolve_effective_virtual_keyboard(profile, &cfg);
     if let Some(ser) = serial {
         if let Err(e) = AdbClient::sync_virtual_keyboard(ser, vk_enabled) {
-            eprintln!("⚠️  Не удалось синхронизировать экранную клавиатуру: {}", e);
+            eprintln!("Warning: failed to sync virtual keyboard: {}", e);
         }
         let smart_resize = profile_supports_smart_resize(profile);
         if let Err(e) = AdbClient::ensure_smart_resize_props(ser, smart_resize) {
-            eprintln!("⚠️  Не удалось применить настройки свободного ресайза: {}", e);
+            eprintln!("Warning: failed to apply smart resize settings: {}", e);
         }
 
         let (host_w, host_h) = AdbClient::get_display_bounds(ser);
         let dims = resolve_window_dimensions(profile, host_w, host_h);
         if let Err(e) = AdbClient::apply_wm_geometry(ser, dims, profile.lcd_density) {
-            eprintln!("⚠️  Не удалось применить wm size/density: {}", e);
+            eprintln!("Warning: failed to apply wm size/density: {}", e);
         } else if let Some((w, h)) = dims {
-            println!("🪟 Адаптация размера экрана Android: {}x{} (экран Waydroid: {}x{})", w, h, host_w, host_h);
+            println!("Display size adapted: {}x{} (host: {}x{})", w, h, host_w, host_h);
         }
     }
 }
 
-/// Installs an `.apk` / `.xapk` / `.apks` / `.apkm` package using the adaptation pipeline.
 pub fn install_bundle_adapted(
     inspection: &BundleInspection,
     profile: &AdaptationProfile,
@@ -217,10 +216,10 @@ pub fn install_bundle_adapted(
     } = inspection.compat.abi_status
     {
         println!(
-            "⚠️  Внимание: пакет требует ARM ABI ({}), а трансляция ARM в контейнере не активна.",
+            "Warning: package requires ARM ABI ({}) but ARM translation is not active.",
             abis.join(", ")
         );
-        println!("👉 Выполните `rustydroid setup-arm`, если установка или запуск завершится ошибкой ABI.");
+        println!("Run `rustydroid setup-arm` if installation or launch fails.");
     }
 
     let selected_splits = select_install_splits(
@@ -243,7 +242,7 @@ pub fn install_bundle_adapted(
     let plan = stage_bundle_artifacts(inspection, &selected_splits, &staging_dir)?;
     if inspection.compat.format != BundleFormat::SingleApk {
         println!(
-            "📦 Распакован {} ({} APK часть/ей, {} OBB)",
+            "Staged {} ({} APK part(s), {} OBB)",
             inspection.compat.format.display_label(),
             plan.apk_paths.len(),
             plan.obb_files.len()
@@ -252,7 +251,6 @@ pub fn install_bundle_adapted(
 
     if let Some(ser) = serial {
         let mut opts = InstallOptions::from_profile(profile);
-        // For single APK without forced ABI, pick best matching ABI if container supports ARM and apk is ARM-only
         if opts.abi.is_none() && container_supports_arm(&container_abis) {
             if let AbiStatus::ArmTranslationRequired { ref abis, .. } = inspection.compat.abi_status {
                 if abis.iter().any(|a| a == "arm64-v8a")
@@ -275,11 +273,11 @@ pub fn install_bundle_adapted(
             }
             Err(adb_err) => {
                 let err_msg = adb_err.to_string();
-                let is_sig_conflict = err_msg.contains("Конфликт цифровой подписи");
+                let is_sig_conflict = err_msg.contains("Signature mismatch");
                 if is_sig_conflict {
                     if prompt_signature_reinstall(&inspection.metadata.package_name) {
                         println!(
-                            "🗑️  Удаляем старую версию {} (конфликт подписи)...",
+                            "Removing existing {} (signature mismatch)...",
                             inspection.metadata.package_name
                         );
                         AdbClient::uninstall_target(ser, &inspection.metadata.package_name)?;
@@ -290,9 +288,9 @@ pub fn install_bundle_adapted(
                     }
                     cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
                     bail!(
-                        "Приложение {} уже установлено в Waydroid с другой цифровой подписью.\n\
-                         👉 Удалите старую версию (данные приложения будут удалены): adb -s {} uninstall {}\n\
-                         👉 Затем запустите снова: rustydroid run \"{}\"",
+                        "Package {} is already installed in Waydroid with a different signature.\n\
+                         Uninstall the old version first (app data will be wiped): adb -s {} uninstall {}\n\
+                         Then run again: rustydroid run \"{}\"",
                         inspection.metadata.package_name,
                         ser,
                         inspection.metadata.package_name,
@@ -300,16 +298,16 @@ pub fn install_bundle_adapted(
                     );
                 }
 
-                let is_definitive_pm_rejection = err_msg.contains("Конфликт")
-                    || err_msg.contains("Несовместимость")
+                let is_definitive_pm_rejection = err_msg.contains("Signature mismatch")
+                    || err_msg.contains("No matching native ABI")
                     || err_msg.contains("minSdkVersion")
                     || err_msg.contains("targetSdkVersion")
-                    || err_msg.contains("Недостаточно памяти")
-                    || err_msg.contains("Некорректный или неподписанный")
-                    || err_msg.contains("Уже установлена более новая");
+                    || err_msg.contains("Newer version already installed")
+                    || err_msg.contains("Test-only package")
+                    || err_msg.contains("Missing required shared system library");
                 if inspection.compat.format == BundleFormat::SingleApk && !is_definitive_pm_rejection {
                     eprintln!(
-                        "⚠️  ADB install вернул ошибку ({}), пробуем waydroid app install...",
+                        "Warning: ADB install failed ({}), trying waydroid app install...",
                         adb_err
                     );
                     fallback_waydroid_install(&inspection.source_path)?;
@@ -326,7 +324,7 @@ pub fn install_bundle_adapted(
     } else {
         cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
         bail!(
-            "Установка split-пакета {} требует активного ADB соединения с Waydroid (проверьте `adb` и состояние контейнера).",
+            "Installing split bundle {} requires an active ADB connection to Waydroid",
             inspection.compat.format.display_label()
         );
     }
@@ -339,14 +337,14 @@ fn finish_adb_install(
     plan: &crate::apk::compat::StagingPlan,
 ) -> Result<()> {
     if let Some(fb) = outcome.used_fallback {
-        println!("🛠️  Применён авто-адаптер установки: {}", fb);
+        println!("Applied install fallback: {}", fb);
     }
     for w in outcome.warnings {
-        println!("⚠️  {}", w);
+        println!("Warning: {}", w);
     }
     if !plan.obb_files.is_empty() {
         println!(
-            "📂 Копирование {} OBB кэш-файлов в /sdcard/Android/obb/...",
+            "Copying {} OBB file(s) to /sdcard/Android/obb/...",
             plan.obb_files.len()
         );
         AdbClient::push_obb_files(serial, &plan.obb_files)?;
@@ -361,8 +359,8 @@ fn prompt_signature_reinstall(package_name: &str) -> bool {
         return false;
     }
     eprint!(
-        "⚠️  Пакет {} уже установлен с другой цифровой подписью.\n\
-         Удалить старую версию (её данные сотрутся) и установить новую? [y/N]: ",
+        "Package {} is already installed with a different signature.\n\
+         Uninstall the old version (app data will be wiped) and install the new one? [y/N]: ",
         package_name
     );
     let _ = io::stderr().flush();
@@ -371,7 +369,7 @@ fn prompt_signature_reinstall(package_name: &str) -> bool {
         return false;
     }
     let ans = line.trim().to_ascii_lowercase();
-    matches!(ans.as_str(), "y" | "yes" | "д" | "да")
+    matches!(ans.as_str(), "y" | "yes")
 }
 
 fn cleanup_staging_dir(format: &BundleFormat, staging_dir: &Path) {
@@ -389,7 +387,7 @@ fn fallback_waydroid_install(apk_path: &Path) -> Result<()> {
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() || waydroid_text_has_error(&stdout) || waydroid_text_has_error(&stderr) {
         bail!(
-            "Не удалось установить APK через Waydroid.\n{}\n{}",
+            "Failed to install APK via Waydroid.\n{}\n{}",
             stdout.trim(),
             stderr.trim()
         );
@@ -511,7 +509,7 @@ impl GrallocDiagnostic {
     }
 
     pub fn remediation_message(&self) -> String {
-        "Обнаружено несоответствие графического аллокатора Waydroid: `ro.hardware.gralloc=gbm` при активном `minigbm_gbm_mesa` вызывает краш окна на Hyprland (x/y < 1).\n👉 Добавьте `ro.hardware.gralloc = minigbm_gbm_mesa` в секцию `[properties]` файла `/var/lib/waydroid/waydroid.cfg` и выполните:\n     sudo waydroid upgrade -o && sudo systemctl restart waydroid-container".to_string()
+        "Waydroid gralloc mismatch detected: `ro.hardware.gralloc=gbm` with active `minigbm_gbm_mesa` causes crashes on Hyprland (x/y < 1).\nAdd `ro.hardware.gralloc = minigbm_gbm_mesa` under `[properties]` in `/var/lib/waydroid/waydroid.cfg` and run:\n  sudo waydroid upgrade -o && sudo systemctl restart waydroid-container".to_string()
     }
 }
 
@@ -655,7 +653,6 @@ fn is_package_installed_via_adb(serial: &str, package: &str) -> Option<bool> {
     }
 }
 
-/// Launches an installed Android app using `waydroid app launch` with ADB Activity fallback.
 pub fn launch_adapted_app(
     serial: Option<&str>,
     package: &str,
@@ -668,7 +665,7 @@ pub fn launch_adapted_app(
     if let Some(ser) = serial {
         if let Some(false) = is_package_installed_via_adb(ser, package) {
             bail!(
-                "Пакет {} не установлен в контейнере Waydroid.\n👉 Установите APK командой: rustydroid run /путь/к/файлу.apk",
+                "Package {} is not installed in the Waydroid container.\nInstall it with: rustydroid run /path/to/app.apk",
                 package
             );
         }
@@ -676,7 +673,7 @@ pub fn launch_adapted_app(
 
     apply_runtime_profile(serial, profile);
 
-    println!("🚀 Запуск окна приложения: {} ({}) ...", display_name, package);
+    println!("Launching {} ({}) ...", display_name, package);
     if !is_waydroid_dbus_session_active() {
         if let Some(ser) = serial {
             AdbClient::launch_app_via_adb(ser, package, activity)?;
@@ -686,7 +683,7 @@ pub fn launch_adapted_app(
         let launch_out = Command::new("waydroid")
             .args(["app", "launch", package])
             .output()
-            .context("Не удалось выполнить waydroid app launch")?;
+            .context("Failed to execute `waydroid app launch`")?;
         let stdout = String::from_utf8_lossy(&launch_out.stdout);
         let stderr = String::from_utf8_lossy(&launch_out.stderr);
 
@@ -696,13 +693,13 @@ pub fn launch_adapted_app(
         {
             if let Some(ser) = serial {
                 eprintln!(
-                    "⚠️  waydroid app launch недоступен ({}), запускаем напрямую через ADB...",
+                    "Warning: `waydroid app launch` unavailable ({}), falling back to ADB...",
                     stderr.trim()
                 );
                 AdbClient::launch_app_via_adb(ser, package, activity)?;
             } else {
                 bail!(
-                    "Не удалось запустить {} через Waydroid.\n{}\n{}",
+                    "Failed to launch {} via Waydroid.\n{}\n{}",
                     package,
                     stdout.trim(),
                     stderr.trim()
@@ -835,12 +832,13 @@ pub fn print_profile_fields(p: &AdaptationProfile) {
     }
 }
 
-/// Finds `install-waydroid-arm-translation.sh` in user/system binary locations.
 pub fn find_arm_setup_script() -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let candidates = [
         PathBuf::from(home).join(".local/bin/install-waydroid-arm-translation.sh"),
+        PathBuf::from("/usr/share/rustydroid/install-waydroid-arm-translation.sh"),
         PathBuf::from("/usr/local/bin/install-waydroid-arm-translation.sh"),
+        PathBuf::from("/usr/bin/install-waydroid-arm-translation.sh"),
     ];
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -1025,7 +1023,7 @@ fn snap_launched_app_window(serial: &str, package: &str, fixed_dpi: Option<u32>)
                 apply_density_if_needed(serial, target_dpi, &mut last_density);
             }
             println!(
-                "📐 Умный размер окна {} адаптирован под Hyprland: {}x{}",
+                "Resized {} window to fit Hyprland bounds: {}x{}",
                 package, win.width, win.height
             );
             break;
@@ -1086,14 +1084,12 @@ fn is_hypr_layout_event(line: &str) -> bool {
     PREFIXES.iter().any(|p| line.starts_with(p))
 }
 
-/// Background event loop (invoked via `rustydroid internal-window-sync`) that listens read-only
-/// to Hyprland's `.socket2.sock` and keeps smart-resize Waydroid tasks fitted to their Hyprland tiles.
 pub fn run_hyprland_window_sync_loop() -> Result<()> {
     let Some(sock_path) = hyprland_socket2_path() else {
         return Ok(());
     };
     let stream = UnixStream::connect(&sock_path)
-        .with_context(|| format!("Не удалось подключиться к {}", sock_path.display()))?;
+        .with_context(|| format!("Failed to connect to {}", sock_path.display()))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream);
 

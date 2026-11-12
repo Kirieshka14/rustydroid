@@ -92,7 +92,7 @@ impl AdaptFlags {
             Some("landscape") | Some("tablet") => Some(WindowMode::TabletLandscape),
             Some("custom") => Some(WindowMode::CustomSize),
             Some(other) => anyhow::bail!(
-                "Неизвестный режим окна '{}'. Доступны: auto, freeform, single, portrait, landscape, custom",
+                "Unknown window mode '{}'. Available: auto, freeform, single, portrait, landscape, custom",
                 other
             ),
         };
@@ -278,7 +278,9 @@ fn find_runner_setup_script() -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let candidates = [
         PathBuf::from(&home).join(".local/bin/install-waydroid-runner.sh"),
+        PathBuf::from("/usr/share/rustydroid/install-waydroid-runner.sh"),
         PathBuf::from("/usr/local/bin/install-waydroid-runner.sh"),
+        PathBuf::from("/usr/bin/install-waydroid-runner.sh"),
     ];
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -325,14 +327,14 @@ fn notify_desktop(title: &str, body: &str) {
 fn read_waydroid_session_error(log_path: &Path) -> String {
     let log_content = std::fs::read_to_string(log_path).unwrap_or_default();
     if log_content.contains("WayDroid container is not listening") {
-        return "Служба контейнера Waydroid (waydroid-container) не запущена.\n👉 Запустите: sudo systemctl start waydroid-container".to_string();
+        return "Waydroid container service (waydroid-container) is not running.\nRun: sudo systemctl start waydroid-container".to_string();
     }
     let summary = log_content
         .lines()
         .last()
-        .unwrap_or("Процесс сессии завершился")
+        .unwrap_or("Session process exited")
         .to_string();
-    format!("Сессия Waydroid завершилась с ошибкой: {}", summary)
+    format!("Waydroid session exited with error: {}", summary)
 }
 
 fn is_systemd_user_unit_failed(unit: &str) -> bool {
@@ -354,22 +356,22 @@ fn wait_for_android_boot_ready(
         return Ok(());
     }
 
-    println!("⏳ Ожидание полной загрузки Android (sys.boot_completed=1)...");
+    println!("Waiting for Android boot completion (sys.boot_completed=1)...");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline {
         if let Some(ref mut c) = child {
             if let Ok(Some(_)) = c.try_wait() {
                 let err = log_path
                     .map(read_waydroid_session_error)
-                    .unwrap_or_else(|| "Сессия Waydroid завершилась во время загрузки Android.".to_string());
+                    .unwrap_or_else(|| "Waydroid session exited during Android boot.".to_string());
                 return Err(err);
             }
         }
         if via_systemd && is_systemd_user_unit_failed("rustydroid-waydroid-session") {
-            return Err("Юнит systemd `rustydroid-waydroid-session` завершился с ошибкой. Проверьте `journalctl --user -u rustydroid-waydroid-session`.".to_string());
+            return Err("Systemd unit `rustydroid-waydroid-session` failed. Check `journalctl --user -u rustydroid-waydroid-session`.".to_string());
         }
         if check_waydroid_runner_state() == WaydroidRunnerState::Stopped {
-            return Err("Сессия Waydroid остановилась во время загрузки Android (проверьте `waydroid status` и `journalctl`).".to_string());
+            return Err("Waydroid session stopped during Android boot (check `waydroid status` and `journalctl`).".to_string());
         }
         AdbClient::unfreeze_waydroid_container();
         if rustydroid::runtime::adapt::is_android_user_ready() {
@@ -378,7 +380,7 @@ fn wait_for_android_boot_ready(
         std::thread::sleep(std::time::Duration::from_millis(750));
     }
 
-    Err("Превышено время ожидания загрузки Android внутри Waydroid (`sys.boot_completed != 1`). Проверьте `waydroid status` и `journalctl`.".to_string())
+    Err("Timed out waiting for Android boot (`sys.boot_completed != 1`). Check `waydroid status` and `journalctl`.".to_string())
 }
 
 fn start_waydroid_session_and_wait() -> Result<(), String> {
@@ -434,7 +436,7 @@ fn start_waydroid_session_and_wait() -> Result<(), String> {
         }
         Some(
             cmd.spawn()
-                .map_err(|e| format!("Не удалось запустить waydroid session start: {}", e))?,
+                .map_err(|e| format!("Failed to spawn waydroid session start: {}", e))?,
         )
     } else {
         None
@@ -448,7 +450,7 @@ fn start_waydroid_session_and_wait() -> Result<(), String> {
             }
         }
         if launched_via_systemd && is_systemd_user_unit_failed("rustydroid-waydroid-session") {
-            return Err("Юнит systemd `rustydroid-waydroid-session` не запустился. Проверьте `journalctl --user -u rustydroid-waydroid-session`.".to_string());
+            return Err("Systemd unit `rustydroid-waydroid-session` failed to start. Check `journalctl --user -u rustydroid-waydroid-session`.".to_string());
         }
         if check_waydroid_runner_state() == WaydroidRunnerState::Running {
             session_running = true;
@@ -458,7 +460,7 @@ fn start_waydroid_session_and_wait() -> Result<(), String> {
     }
 
     if !session_running {
-        return Err("Превышено время ожидания запуска сессии Waydroid (проверьте `waydroid status`).".to_string());
+        return Err("Timed out waiting for Waydroid session start (check `waydroid status`).".to_string());
     }
 
     wait_for_android_boot_ready(child.as_mut(), launched_via_systemd, Some(&log_path), 90)
@@ -471,7 +473,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Info { apk_path } => {
             let normalized_str = normalize_path_str(&apk_path.to_string_lossy());
             let apk_path = PathBuf::from(&normalized_str);
-            println!("🔍 Inspecting package: {}", apk_path.display());
+            println!("Inspecting package: {}", apk_path.display());
             let overrides = ProfileOverrides::default();
             let (_pkg, _act, app_name, maybe_insp, profile) =
                 inspect_target_or_package(&normalized_str, true, &overrides)?;
@@ -481,7 +483,7 @@ fn main() -> anyhow::Result<()> {
             notify_desktop(
                 &format!("RustyDroid: {}", app_name),
                 &format!(
-                    "Пакет: {}\nВерсия: {}\nABI: {}\nРазрешений: {}",
+                    "Package: {}\nVersion: {}\nABI: {}\nPermissions: {}",
                     meta.package_name,
                     meta.version_name.as_deref().unwrap_or("1.0"),
                     if inspection.compat.native_abis.is_empty() {
@@ -493,7 +495,7 @@ fn main() -> anyhow::Result<()> {
                 ),
             );
 
-            println!("\n📋 APK Metadata:");
+            println!("\nAPK Metadata:");
             println!("  • App Label:     {}", meta.app_label.as_deref().unwrap_or("N/A"));
             println!("  • Package Name:  {}", meta.package_name);
             println!("  • Version Name:  {}", meta.version_name.as_deref().unwrap_or("N/A"));
@@ -505,7 +507,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             if !meta.permissions.is_empty() {
-                println!("\n🔐 Permissions ({} total):", meta.permissions.len());
+                println!("\nPermissions ({} total):", meta.permissions.len());
                 for (i, perm) in meta.permissions.iter().enumerate() {
                     let short_perm = perm.strip_prefix("android.permission.").unwrap_or(perm);
                     println!("    {}. {}", i + 1, short_perm);
@@ -518,44 +520,42 @@ fn main() -> anyhow::Result<()> {
         Commands::Install { apk_path, flags } => {
             let normalized_str = normalize_path_str(&apk_path.to_string_lossy());
             let apk_path = PathBuf::from(&normalized_str);
-            println!("📦 Installing package: {}", apk_path.display());
+            println!("Installing package: {}", apk_path.display());
             let overrides = flags.to_overrides()?;
             let (_pkg, _act, app_name, maybe_insp, profile) =
                 inspect_target_or_package(&normalized_str, true, &overrides)?;
             let inspection = maybe_insp.expect("archive inspection must produce BundleInspection");
             let meta = &inspection.metadata;
 
-            // 1. Generate desktop file and save icon
             let desktop_file = DesktopIntegration::install_desktop_entry(meta, None)?;
-            println!("✅ Desktop entry registered: {}", desktop_file.display());
+            println!("Desktop entry registered: {}", desktop_file.display());
             if let Some(ref icon) = meta.icon_data {
-                println!("🖼️  Extracted app icon ({} bytes)", icon.len());
+                println!("Extracted app icon ({} bytes)", icon.len());
             }
 
             if flags.save_profile || flags.has_explicit_overrides() {
                 let saved = ProfileStore::save(&profile)?;
-                println!("⚙️  Профиль адаптации сохранён: {}", saved.display());
+                println!("Saved adaptation profile: {}", saved.display());
             }
 
             notify_desktop(
                 "RustyDroid",
-                &format!("✅ Приложение {} добавлено в меню приложений!", app_name),
+                &format!("{} added to application menu", app_name),
             );
 
-            // 2. Install inside running Waydroid / container if available
             if !is_headless_or_test_env() && check_waydroid_runner_state() == WaydroidRunnerState::Running {
-                println!("📲 Установка адаптированного пакета в Waydroid...");
+                println!("Installing adapted package into Waydroid...");
                 let serial = try_connect_waydroid_adb();
                 install_bundle_adapted(&inspection, &profile, serial.as_deref())?;
-                println!("✅ Пакет {} установлен в Waydroid!", meta.package_name);
+                println!("Installed {} in Waydroid.", meta.package_name);
             } else if SessionManager::is_running() && AdbClient::is_adb_available() {
-                println!("📲 Installing into running container...");
+                println!("Installing into running container...");
                 match AdbClient::install_apk(&apk_path.to_string_lossy()) {
-                    Ok(out) => println!("✅ {}", out.trim()),
-                    Err(e) => eprintln!("⚠️ Container install note: {}", e),
+                    Ok(out) => println!("{}", out.trim()),
+                    Err(e) => eprintln!("Container install note: {}", e),
                 }
             } else {
-                println!("ℹ️  Сессия не активна — пакет будет установлен автоматически при первом запуске.");
+                println!("Waydroid session inactive; package will be installed on first launch.");
             }
         }
 
@@ -568,78 +568,75 @@ fn main() -> anyhow::Result<()> {
 
             let overrides = flags.to_overrides()?;
             if is_apk {
-                println!("📦 Inspecting APK: {}", target);
+                println!("Inspecting APK: {}", target);
             } else {
-                println!("📦 Launching package: {}", target);
+                println!("Launching package: {}", target);
             }
             let (package, activity, display_name, maybe_inspection, profile) =
                 inspect_target_or_package(&target, is_apk, &overrides)?;
 
             if is_apk {
-                println!("🚀 App: {} ({})", display_name, package);
-                notify_desktop("RustyDroid", &format!("Запуск {}...", display_name));
+                println!("App: {} ({})", display_name, package);
+                notify_desktop("RustyDroid", &format!("Launching {}...", display_name));
                 if let Some(ref insp) = maybe_inspection {
                     let _ = DesktopIntegration::install_desktop_entry(&insp.metadata, None);
                     for warn in &insp.compat.warnings {
-                        println!("⚠️  {}", warn);
+                        println!("Warning: {}", warn);
                     }
                 }
             } else {
-                notify_desktop("RustyDroid", &format!("Запуск пакета {}...", target));
+                notify_desktop("RustyDroid", &format!("Launching package {}...", target));
             }
 
             if flags.save_profile {
                 let saved = ProfileStore::save(&profile)?;
-                println!("⚙️  Профиль адаптации сохранён: {}", saved.display());
+                println!("Saved adaptation profile: {}", saved.display());
             }
 
-            // Check if Android system images are installed cleanly
             let img_status = ImageManager::check_status();
             if !img_status.system_img_exists {
-                eprintln!("\n⚠️  ВНИМАНИЕ: Системный образ Android (system.img) не найден!");
-                eprintln!("   Без системного образа (LineageOS / AOSP) Android-приложение не сможет отрисовать окно.");
-                eprintln!("   👉 Установите образ командой: sudo pacman -S waydroid-image");
-                eprintln!("      или поместите system.img в: {}", img_status.images_dir.display());
+                eprintln!("\nWarning: Android system image (system.img) not found.");
+                eprintln!("An Android image (LineageOS / AOSP) is required to render windows.");
+                eprintln!("Install an image (e.g. `waydroid-image`) or place system.img in: {}", img_status.images_dir.display());
 
                 notify_desktop(
-                    "RustyDroid: Требуется образ Android",
-                    "Установите 'waydroid-image' (sudo pacman -S waydroid-image) для запуска окна приложения",
+                    "RustyDroid: Android Image Missing",
+                    "Install 'waydroid-image' to render Android windows",
                 );
             }
 
-            // Ensure lightweight session state bookkeeping in headless/test runs
             if is_headless_or_test_env() {
                 if !SessionManager::is_running() {
-                    println!("⚙️  Starting RustyDroid container session...");
+                    println!("Starting RustyDroid container session...");
                     match SessionManager::start_session() {
-                        Ok(pid) => println!("🟢 Container session started (PID: {})", pid),
-                        Err(e) => eprintln!("⚠️ Note starting session: {}", e),
+                        Ok(pid) => println!("Container session started (PID: {})", pid),
+                        Err(e) => eprintln!("Note starting session: {}", e),
                     }
                 }
-                eprintln!("ℹ️  Wayland display socket not found (graphical runner skipped in headless/sandbox mode).");
+                eprintln!("Wayland display socket not found (graphical runner skipped in headless/sandbox mode).");
                 return Ok(());
             }
 
             match check_waydroid_runner_state() {
                 WaydroidRunnerState::NotInstalled | WaydroidRunnerState::NotInitialized => {
-                    let msg = "Графический раннер Waydroid не установлен или не инициализирован. Выполните `rustydroid setup-runner`.";
-                    eprintln!("\n❌ {}", msg);
-                    notify_desktop("RustyDroid: Требуется настройка раннера", msg);
+                    let msg = "Waydroid runner is not installed or initialized. Run `rustydroid setup-runner`.";
+                    eprintln!("\nError: {}", msg);
+                    notify_desktop("RustyDroid: Setup Required", msg);
                     anyhow::bail!("{}", msg);
                 }
                 WaydroidRunnerState::Stopped => {
-                    println!("🔄 Запуск сессии Waydroid на рабочем столе (первый старт Android может занять до 60 сек)...");
-                    notify_desktop("RustyDroid", "Запуск сессии Android (подождите ~15–45 сек)...");
+                    println!("Starting Waydroid session (cold boot may take up to 60s)...");
+                    notify_desktop("RustyDroid", "Starting Android session...");
                     if let Err(err) = start_waydroid_session_and_wait() {
-                        eprintln!("\n❌ {}", err);
-                        notify_desktop("RustyDroid: Служба не запущена", &err);
+                        eprintln!("\nError: {}", err);
+                        notify_desktop("RustyDroid: Session Failed", &err);
                         anyhow::bail!("{}", err);
                     }
                 }
                 WaydroidRunnerState::Running => {
                     if let Err(err) = wait_for_android_boot_ready(None, false, None, 90) {
-                        eprintln!("\n❌ {}", err);
-                        notify_desktop("RustyDroid: Android не готов", &err);
+                        eprintln!("\nError: {}", err);
+                        notify_desktop("RustyDroid: Android Not Ready", &err);
                         anyhow::bail!("{}", err);
                     }
                 }
@@ -648,8 +645,8 @@ fn main() -> anyhow::Result<()> {
             let gralloc_diag = detect_waydroid_gralloc_diagnostic(true);
             if gralloc_diag.is_mismatch() {
                 let msg = gralloc_diag.remediation_message();
-                eprintln!("\n❌ {}", msg);
-                notify_desktop("RustyDroid: Ошибка графики Waydroid (gralloc)", &msg);
+                eprintln!("\nError: {}", msg);
+                notify_desktop("RustyDroid: Waydroid Gralloc Mismatch", &msg);
                 anyhow::bail!("{}", msg);
             }
 
@@ -670,7 +667,7 @@ fn main() -> anyhow::Result<()> {
 
             if let Err(err) = launch_result {
                 let err_text = format!("{}", err);
-                notify_desktop("RustyDroid: Ошибка запуска приложения", &err_text);
+                notify_desktop("RustyDroid: Launch Failed", &err_text);
                 return Err(err);
             }
         }
@@ -751,11 +748,11 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or("unknown");
             if gralloc_diag.is_mismatch() {
                 println!(
-                    "  • Graphics Gralloc:   {} ⚠️  (mismatch с minigbm_gbm_mesa! Требуется minigbm_gbm_mesa)",
+                    "  • Graphics Gralloc:   {} (mismatch: minigbm_gbm_mesa required)",
                     gralloc_label
                 );
             } else {
-                println!("  • Graphics Gralloc:   {} ✅", gralloc_label);
+                println!("  • Graphics Gralloc:   {} (OK)", gralloc_label);
             }
             let abis = rustydroid::runtime::adapt::detect_container_abis();
             let arm_ok = rustydroid::apk::compat::container_supports_arm(&abis);
@@ -763,29 +760,29 @@ fn main() -> anyhow::Result<()> {
                 "  • Container ABIs:     {} ({})",
                 abis.join(", "),
                 if arm_ok {
-                    "ARM/ARM64 ready ✅"
+                    "ARM/ARM64 ready"
                 } else {
-                    "x86 only ⚠️ run `rustydroid setup-arm`"
+                    "x86 only, run `rustydroid setup-arm`"
                 }
             );
 
             // 9. Session Status
             let session_info = SessionManager::get_state();
             println!("\n  • Session Status:     {}", match session_info {
-                Some(s) => format!("RUNNING 🟢 (PID: {}, Mode: {})", s.pid, s.display_mode),
-                None => "STOPPED ⚪".to_string(),
+                Some(s) => format!("RUNNING (PID: {}, Mode: {})", s.pid, s.display_mode),
+                None => "STOPPED".to_string(),
             });
 
             // 10. Images
             let img_status = ImageManager::check_status();
             println!("  • Android Images:     system.img: {}, vendor.img: {}",
-                if img_status.system_img_exists { "Found ✅" } else { "None" },
-                if img_status.vendor_img_exists { "Found ✅" } else { "None" }
+                if img_status.system_img_exists { "Found" } else { "None" },
+                if img_status.vendor_img_exists { "Found" } else { "None" }
             );
             // 11. Virtual Keyboard (IME)
             let cfg = ConfigManager::load_or_default();
             println!(
-                "  • Virtual Keyboard:   {} (управление: `rustydroid keyboard on|off`)",
+                "  • Virtual Keyboard:   {} (use `rustydroid keyboard on|off`)",
                 if cfg.virtual_keyboard { "ON" } else { "OFF (default)" }
             );
         }
@@ -795,7 +792,7 @@ fn main() -> anyhow::Result<()> {
                 let target = normalize_path_str(&target);
                 let is_apk = is_package_archive_path(&target);
                 if is_apk && !Path::new(&target).exists() {
-                    anyhow::bail!("Файл пакета не найден: {}", target);
+                    anyhow::bail!("Package file not found: {}", target);
                 }
                 let (_pkg, _act, _label, maybe_insp, profile) =
                     inspect_target_or_package(&target, is_apk, &ProfileOverrides::default())?;
@@ -804,9 +801,9 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     let has_saved = ProfileStore::load(&profile.package_name).is_some();
                     println!(
-                        "⚙️  Профиль адаптации для {} ({}):",
+                        "Adaptation profile for {} ({}):",
                         profile.package_name,
-                        if has_saved { "сохранённый" } else { "по умолчанию" }
+                        if has_saved { "saved" } else { "default" }
                     );
                     print_profile_fields(&profile);
                 }
@@ -818,22 +815,22 @@ fn main() -> anyhow::Result<()> {
                 let (pkg, _act, _label, _maybe_insp, profile) =
                     inspect_target_or_package(&target, is_apk, &overrides)?;
                 let path = ProfileStore::save(&profile)?;
-                println!("✅ Профиль для {} сохранён: {}", pkg, path.display());
+                println!("Saved profile for {}: {}", pkg, path.display());
                 print_profile_fields(&profile);
             }
             AdaptAction::Reset { package_name } => {
                 if ProfileStore::remove(&package_name)? {
-                    println!("🗑️  Сохранённый профиль для {} удалён.", package_name);
+                    println!("Removed saved profile for {}.", package_name);
                 } else {
-                    println!("ℹ️  Профиль для {} не найден.", package_name);
+                    println!("No saved profile found for {}.", package_name);
                 }
             }
             AdaptAction::List => {
                 let profiles = ProfileStore::list_all();
                 if profiles.is_empty() {
-                    println!("ℹ️  Сохранённых per-app профилей адаптации пока нет.");
+                    println!("No saved per-app adaptation profiles.");
                 } else {
-                    println!("📋 Профили адаптации RustyDroid ({}):", profiles.len());
+                    println!("RustyDroid adaptation profiles ({}):", profiles.len());
                     for p in profiles {
                         println!(
                             "  • {} — mode={:?}, fake_wifi={}, fake_touch={}, installer={}",
@@ -854,51 +851,53 @@ fn main() -> anyhow::Result<()> {
             KeyboardAction::Status => {
                 let cfg = ConfigManager::load_or_default();
                 println!(
-                    "⌨️  Глобальная настройка виртуальной клавиатуры: {}",
+                    "Global virtual keyboard setting: {}",
                     if cfg.virtual_keyboard {
-                        "ВКЛ (ON)"
+                        "ON"
                     } else {
-                        "ВЫКЛ (OFF, по умолчанию)"
+                        "OFF (default)"
                     }
                 );
                 if let Some(serial) = try_connect_waydroid_adb_with_retry(2, 200) {
                     match AdbClient::get_virtual_keyboard_status(&serial) {
                         Ok((live_on, imes)) => println!(
-                            "📱 Живое состояние Android IME ({}): {}",
+                            "Android IME state ({}): {}",
                             serial,
                             if live_on {
-                                format!("ВКЛ ({})", imes.join(", "))
+                                format!("ON ({})", imes.join(", "))
                             } else {
-                                "ВЫКЛ (активных IME нет)".to_string()
+                                "OFF (no active IMEs)".to_string()
                             }
                         ),
-                        Err(e) => println!("⚠️  Не удалось прочитать статус Android IME: {}", e),
+                        Err(e) => println!("Warning: failed to query Android IME status: {}", e),
                     }
                 } else {
-                    println!("ℹ️  Контейнер Waydroid не активен (настройка применится при запуске).");
+                    println!("Waydroid container is inactive (setting will apply on launch).");
                 }
             }
         },
 
         Commands::SetupArm => {
-            println!("🛠️  Установка слоя ARM/ARM64 трансляции (libndk_translation) для Waydroid...");
+            println!("Setting up ARM/ARM64 translation layer (libndk_translation) for Waydroid...");
             let Some(script) = find_arm_setup_script() else {
-                anyhow::bail!("Скрипт install-waydroid-arm-translation.sh не найден в ~/.local/bin/");
+                anyhow::bail!(
+                    "Setup script install-waydroid-arm-translation.sh not found in ~/.local/bin/ or /usr/share/rustydroid/"
+                );
             };
             run_privileged_setup_script(
                 &script,
-                "✅ Слой ARM/ARM64 трансляции (libndk_translation) настроен!",
+                "ARM/ARM64 translation layer (libndk_translation) configured.",
             )?;
         }
 
         Commands::Stop => {
-            println!("🛑 Stopping RustyDroid session...");
+            println!("Stopping RustyDroid session...");
             let was_running = SessionManager::is_running();
             SessionManager::stop_session()?;
             if was_running {
-                println!("✅ RustyDroid session stopped.");
+                println!("RustyDroid session stopped.");
             } else {
-                println!("ℹ️  No active session found.");
+                println!("No active session found.");
             }
         }
 
@@ -920,22 +919,24 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::SetupRunner => {
-            println!("🛠️  Настройка графического раннера Waydroid...");
+            println!("Setting up Waydroid graphical runner...");
             let Some(script) = find_runner_setup_script() else {
-                anyhow::bail!("Скрипт установки install-waydroid-runner.sh не найден в ~/.local/bin/");
+                anyhow::bail!(
+                    "Setup script install-waydroid-runner.sh not found in ~/.local/bin/ or /usr/share/rustydroid/"
+                );
             };
             run_privileged_setup_script(
                 &script,
-                "✅ Раннер Waydroid настроен и запущен!",
+                "Waydroid runner configured and started.",
             )?;
             let diag = detect_waydroid_gralloc_diagnostic(false);
             if diag.base_prop_gralloc.as_deref() == Some("gbm")
                 && !diag.legacy_gbm_enabled
                 && diag.cfg_prop_gralloc.as_deref() != Some("minigbm_gbm_mesa")
             {
-                eprintln!("\n⚠️  Примечание: в `waydroid_base.prop` прописано `ro.hardware.gralloc=gbm`.");
-                eprintln!("   Если Android 13 образ использует `minigbm_gbm_mesa`, добавьте `ro.hardware.gralloc = minigbm_gbm_mesa`");
-                eprintln!("   в [properties] файла `/var/lib/waydroid/waydroid.cfg` и выполните `sudo waydroid upgrade -o`.");
+                eprintln!("\nNote: `waydroid_base.prop` sets `ro.hardware.gralloc=gbm`.");
+                eprintln!("If the Android image uses `minigbm_gbm_mesa`, set `ro.hardware.gralloc = minigbm_gbm_mesa`");
+                eprintln!("under [properties] in `/var/lib/waydroid/waydroid.cfg` and run `sudo waydroid upgrade -o`.");
             }
         }
 
@@ -958,17 +959,13 @@ fn set_virtual_keyboard_global(enabled: bool) -> anyhow::Result<()> {
     let mut cfg = ConfigManager::load_or_default();
     cfg.virtual_keyboard = enabled;
     ConfigManager::save(&cfg)?;
-    let label = if enabled {
-        "ВКЛЮЧЕНА (ON)"
-    } else {
-        "ВЫКЛЮЧЕНА (OFF)"
-    };
-    println!("⌨️  Виртуальная клавиатура Android глобально {}", label);
+    let label = if enabled { "ON" } else { "OFF" };
+    println!("Android virtual keyboard set to {} globally", label);
     if let Some(serial) = try_connect_waydroid_adb_with_retry(2, 200) {
         AdbClient::sync_virtual_keyboard(&serial, enabled)?;
-        println!("✅ Применено к запущенному контейнеру Waydroid ({})", serial);
+        println!("Applied to running Waydroid container ({})", serial);
     } else {
-        println!("ℹ️  Настройка сохранена и применится при следующем запуске приложения.");
+        println!("Setting saved; it will apply on next launch.");
     }
     Ok(())
 }
@@ -982,11 +979,11 @@ fn run_privileged_setup_script(script: &Path, success_msg: &str) -> anyhow::Resu
         if status.success() {
             println!("{}", success_msg);
         } else {
-            anyhow::bail!("Установка завершилась с ошибкой (код {:?})", status.code());
+            anyhow::bail!("Setup failed with exit code {:?}", status.code());
         }
     } else {
         let cmd_str = format!(
-            "sudo '{}'; echo ''; read -p 'Нажмите Enter для закрытия...'",
+            "sudo '{}'; echo ''; read -p 'Press Enter to close...'",
             script.display()
         );
         let spawned = std::process::Command::new("kitty")
@@ -995,7 +992,7 @@ fn run_privileged_setup_script(script: &Path, success_msg: &str) -> anyhow::Resu
         if spawned.is_err() {
             let status = std::process::Command::new("pkexec").arg(script).status()?;
             if !status.success() {
-                anyhow::bail!("Установка через pkexec не завершена");
+                anyhow::bail!("Setup via pkexec did not complete");
             }
         }
     }
