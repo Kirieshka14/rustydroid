@@ -16,6 +16,6 @@ pkgbase = rustydroid
 	optdepends = hyprland: automatic window resizing via socket2
 	optdepends = bubblewrap: fallback namespace shell
 	source = rustydroid-0.1.0.tar.gz::https://github.com/Kirieshka14/rustydroid/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = 12e71398c11d875f65d8cee9c213baad60172e56fada9a9de8d2d63386bc5683
 
 pkgname = rustydroid
