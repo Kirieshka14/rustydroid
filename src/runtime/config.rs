@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub display_mode: DisplayMode,
     pub enable_gpu: bool,
     pub enable_audio: bool,
+    #[serde(default)]
+    pub virtual_keyboard: bool,
     pub system_image_url: String,
     pub vendor_image_url: String,
 }
@@ -27,6 +29,7 @@ impl Default for AppConfig {
             display_mode: DisplayMode::MultiWindow,
             enable_gpu: true,
             enable_audio: true,
+            virtual_keyboard: false,
             system_image_url: "https://sourceforge.net/projects/waydroid/files/images/system/lineage/waydroid_x86_64/lineage-18.1-20240120-VANILLA-waydroid_x86_64-system.img.7z/download".to_string(),
             vendor_image_url: "https://sourceforge.net/projects/waydroid/files/images/vendor/waydroid_x86_64/lineage-18.1-20240120-MAINLINE-waydroid_x86_64-vendor.img.7z/download".to_string(),
         }

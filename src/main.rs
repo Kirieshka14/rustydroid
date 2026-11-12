@@ -9,7 +9,7 @@ use rustydroid::container::{ContainerConfig, MountManager, NamespaceManager};
 use rustydroid::runtime::adapt::{
     detect_waydroid_gralloc_diagnostic, find_arm_setup_script, inspect_target_or_package,
     install_bundle_adapted, launch_adapted_app, print_compatibility_report, print_profile_fields,
-    try_connect_waydroid_adb, try_connect_waydroid_adb_with_retry,
+    run_hyprland_window_sync_loop, try_connect_waydroid_adb, try_connect_waydroid_adb_with_retry,
 };
 use rustydroid::runtime::{ConfigManager, ImageManager, SessionManager};
 use std::path::{Path, PathBuf};
@@ -70,6 +70,12 @@ struct AdaptFlags {
     /// Force low-target-SDK compatibility (--force-sdk)
     #[arg(long = "force-sdk")]
     force_sdk: bool,
+    /// Enable Android on-screen virtual keyboard (IME) for this app/run
+    #[arg(long = "ime", conflicts_with = "no_ime")]
+    ime: bool,
+    /// Disable Android on-screen virtual keyboard (IME) for this app/run (default)
+    #[arg(long = "no-ime")]
+    no_ime: bool,
     /// Save these adaptation settings as a persistent per-app profile
     #[arg(long = "save-profile")]
     save_profile: bool,
@@ -121,6 +127,13 @@ impl AdaptFlags {
             abi_override: self.abi.as_ref().map(|s| Some(s.clone())),
             allow_downgrade: if self.allow_downgrade { Some(true) } else { None },
             force_sdk: if self.force_sdk { Some(true) } else { None },
+            virtual_keyboard: if self.ime {
+                Some(Some(true))
+            } else if self.no_ime {
+                Some(Some(false))
+            } else {
+                None
+            },
         })
     }
 
@@ -139,7 +152,19 @@ impl AdaptFlags {
             || self.no_auto_grant
             || self.allow_downgrade
             || self.force_sdk
+            || self.ime
+            || self.no_ime
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum KeyboardAction {
+    /// Enable Android on-screen virtual keyboard (IME)
+    On,
+    /// Disable Android on-screen virtual keyboard (IME, default)
+    Off,
+    /// Show virtual keyboard configuration and live Android IME status
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -184,6 +209,12 @@ enum Commands {
         #[command(subcommand)]
         action: AdaptAction,
     },
+    /// Toggle Android on-screen virtual keyboard (OFF by default to prevent Hyprland window splits)
+    #[command(visible_alias = "ime")]
+    Keyboard {
+        #[command(subcommand)]
+        action: KeyboardAction,
+    },
     /// Install Android ARM/ARM64 (libndk_translation) layer in Waydroid (requires sudo once)
     SetupArm,
     /// Initialize directories and check system requirements
@@ -204,6 +235,9 @@ enum Commands {
     InternalBinderfs {
         path: PathBuf,
     },
+    /// Internal Hyprland socket2 listener for live Waydroid window resizing
+    #[command(hide = true)]
+    InternalWindowSync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -748,6 +782,12 @@ fn main() -> anyhow::Result<()> {
                 if img_status.system_img_exists { "Found ✅" } else { "None" },
                 if img_status.vendor_img_exists { "Found ✅" } else { "None" }
             );
+            // 11. Virtual Keyboard (IME)
+            let cfg = ConfigManager::load_or_default();
+            println!(
+                "  • Virtual Keyboard:   {} (управление: `rustydroid keyboard on|off`)",
+                if cfg.virtual_keyboard { "ON" } else { "OFF (default)" }
+            );
         }
 
         Commands::Adapt { action } => match action {
@@ -804,6 +844,38 @@ fn main() -> anyhow::Result<()> {
                             p.installer_spoof.as_deref().unwrap_or("none")
                         );
                     }
+                }
+            }
+        },
+
+        Commands::Keyboard { action } => match action {
+            KeyboardAction::On => set_virtual_keyboard_global(true)?,
+            KeyboardAction::Off => set_virtual_keyboard_global(false)?,
+            KeyboardAction::Status => {
+                let cfg = ConfigManager::load_or_default();
+                println!(
+                    "⌨️  Глобальная настройка виртуальной клавиатуры: {}",
+                    if cfg.virtual_keyboard {
+                        "ВКЛ (ON)"
+                    } else {
+                        "ВЫКЛ (OFF, по умолчанию)"
+                    }
+                );
+                if let Some(serial) = try_connect_waydroid_adb_with_retry(2, 200) {
+                    match AdbClient::get_virtual_keyboard_status(&serial) {
+                        Ok((live_on, imes)) => println!(
+                            "📱 Живое состояние Android IME ({}): {}",
+                            serial,
+                            if live_on {
+                                format!("ВКЛ ({})", imes.join(", "))
+                            } else {
+                                "ВЫКЛ (активных IME нет)".to_string()
+                            }
+                        ),
+                        Err(e) => println!("⚠️  Не удалось прочитать статус Android IME: {}", e),
+                    }
+                } else {
+                    println!("ℹ️  Контейнер Waydroid не активен (настройка применится при запуске).");
                 }
             }
         },
@@ -873,8 +945,31 @@ fn main() -> anyhow::Result<()> {
                 let _ = BinderManager::setup_standard_devices(&path);
             }
         }
+
+        Commands::InternalWindowSync => {
+            run_hyprland_window_sync_loop()?;
+        }
     }
 
+    Ok(())
+}
+
+fn set_virtual_keyboard_global(enabled: bool) -> anyhow::Result<()> {
+    let mut cfg = ConfigManager::load_or_default();
+    cfg.virtual_keyboard = enabled;
+    ConfigManager::save(&cfg)?;
+    let label = if enabled {
+        "ВКЛЮЧЕНА (ON)"
+    } else {
+        "ВЫКЛЮЧЕНА (OFF)"
+    };
+    println!("⌨️  Виртуальная клавиатура Android глобально {}", label);
+    if let Some(serial) = try_connect_waydroid_adb_with_retry(2, 200) {
+        AdbClient::sync_virtual_keyboard(&serial, enabled)?;
+        println!("✅ Применено к запущенному контейнеру Waydroid ({})", serial);
+    } else {
+        println!("ℹ️  Настройка сохранена и применится при следующем запуске приложения.");
+    }
     Ok(())
 }
 

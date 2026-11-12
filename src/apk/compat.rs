@@ -171,6 +171,8 @@ pub struct AdaptationProfile {
     #[serde(default)]
     pub force_sdk: bool,
     #[serde(default)]
+    pub virtual_keyboard: Option<bool>,
+    #[serde(default)]
     pub extra_props: BTreeMap<String, String>,
 }
 
@@ -198,6 +200,7 @@ impl Default for AdaptationProfile {
             allow_test_only: true,
             allow_downgrade: false,
             force_sdk: false,
+            virtual_keyboard: None,
             extra_props: BTreeMap::new(),
         }
     }
@@ -216,6 +219,7 @@ pub struct ProfileOverrides {
     pub abi_override: Option<Option<String>>,
     pub allow_downgrade: Option<bool>,
     pub force_sdk: Option<bool>,
+    pub virtual_keyboard: Option<Option<bool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1187,6 +1191,7 @@ impl AdaptationProfile {
             allow_test_only: true,
             allow_downgrade: false,
             force_sdk,
+            virtual_keyboard: None,
             extra_props: BTreeMap::new(),
         }
     }
@@ -1228,6 +1233,9 @@ impl AdaptationProfile {
         }
         if let Some(fs) = overrides.force_sdk {
             self.force_sdk = fs;
+        }
+        if let Some(vk) = overrides.virtual_keyboard {
+            self.virtual_keyboard = vk;
         }
     }
 }

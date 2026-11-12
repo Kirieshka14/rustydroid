@@ -594,4 +594,203 @@ impl AdbClient {
         }
         Ok(())
     }
+
+    /// Reads current Android tasks from `am stack list` and returns visible ones.
+    pub fn get_visible_tasks(serial: &str) -> Result<Vec<AndroidTaskInfo>> {
+        let out = Self::shell_for(serial, &["am", "stack", "list"])?;
+        Ok(parse_android_tasks(&out)
+            .into_iter()
+            .filter(|t| t.visible)
+            .collect())
+    }
+
+    /// Forces an Android task to be resizeable (mode 2 = resizeable) and sets its bounds to `(0, 0, w, h)`.
+    pub fn resize_task_bounds(serial: &str, task_id: u32, w: u32, h: u32) -> Result<()> {
+        let cmd = format!(
+            "am task resizeable {tid} 2 && am task resize {tid} 0 0 {w} {h}",
+            tid = task_id,
+            w = w,
+            h = h
+        );
+        let _ = Self::shell_for(serial, &[&cmd])?;
+        Ok(())
+    }
+
+    /// Configures Android window manager settings for free/smart resizing across any Hyprland window size.
+    pub fn ensure_smart_resize_props(serial: &str, ignore_orientation: bool) -> Result<()> {
+        let _ = Self::shell_for(
+            serial,
+            &["settings", "put", "global", "enable_non_resizable_multi_window", "1"],
+        )?;
+        let orient_arg = if ignore_orientation { "true" } else { "false" };
+        let _ = Self::shell_for(
+            serial,
+            &["cmd", "window", "set-ignore-orientation-request", orient_arg],
+        )?;
+        Ok(())
+    }
+
+    /// Reads current effective `wm density` (preferring override density if set, otherwise physical density).
+    pub fn read_current_density(serial: &str) -> Option<u32> {
+        let out = Self::shell_for(serial, &["wm", "density"]).ok()?;
+        let mut physical = None;
+        for line in out.lines() {
+            let trimmed = line.trim();
+            if let Some(val) = trimmed.strip_prefix("Override density:") {
+                if let Ok(dpi) = val.trim().parse::<u32>() {
+                    return Some(dpi);
+                }
+            } else if let Some(val) = trimmed.strip_prefix("Physical density:") {
+                if let Ok(dpi) = val.trim().parse::<u32>() {
+                    physical = Some(dpi);
+                }
+            }
+        }
+        physical
+    }
+
+    /// Sets or resets only `wm density` without disturbing `wm size`.
+    pub fn apply_density_only(serial: &str, density: Option<u32>) -> Result<()> {
+        match density {
+            Some(dpi) => {
+                let dpi_arg = dpi.to_string();
+                let _ = Self::shell_for(serial, &["wm", "density", &dpi_arg])?;
+            }
+            None => {
+                if Self::shell_for(serial, &["wm", "density"])
+                    .map(|out| out.contains("Override density:"))
+                    .unwrap_or(false)
+                {
+                    let _ = Self::shell_for(serial, &["wm", "density", "reset"])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enables or disables the Android on-screen soft keyboard (LatinIME) cleanly without disrupting hardware typing.
+    pub fn sync_virtual_keyboard(serial: &str, enabled: bool) -> Result<()> {
+        const DEFAULT_IME: &str = "com.android.inputmethod.latin/.LatinIME";
+        let show_val = if enabled { "1" } else { "0" };
+        let _ = Self::shell_for(
+            serial,
+            &["settings", "put", "secure", "show_ime_with_hard_keyboard", show_val],
+        )?;
+        if enabled {
+            let _ = Self::shell_for(serial, &["ime", "enable", DEFAULT_IME])?;
+            let _ = Self::shell_for(serial, &["ime", "set", DEFAULT_IME])?;
+        } else {
+            let active_list = Self::shell_for(serial, &["ime", "list", "-s"]).unwrap_or_default();
+            let mut disabled_any = false;
+            for ime_id in active_list.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                let _ = Self::shell_for(serial, &["ime", "disable", ime_id])?;
+                disabled_any = true;
+            }
+            if !disabled_any {
+                let _ = Self::shell_for(serial, &["ime", "disable", DEFAULT_IME]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Queries live Android IME state (`enabled`, active IME IDs).
+    pub fn get_virtual_keyboard_status(serial: &str) -> Result<(bool, Vec<String>)> {
+        let out = Self::shell_for(serial, &["ime", "list", "-s"])?;
+        let imes: Vec<String> = out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        Ok((!imes.is_empty(), imes))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidTaskInfo {
+    pub task_id: u32,
+    pub package: String,
+    pub bounds: (i32, i32, i32, i32),
+    pub visible: bool,
+}
+
+/// Parses `am stack list` lines containing `taskId=<id>: <pkg>/<act> bounds=[l,t][r,b] ... visible=<bool>`.
+pub fn parse_android_tasks(stack_list: &str) -> Vec<AndroidTaskInfo> {
+    let mut tasks = Vec::new();
+    for line in stack_list.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("taskId=") else {
+            continue;
+        };
+        let Some((id_str, after_id)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(task_id) = id_str.trim().parse::<u32>() else {
+            continue;
+        };
+        let after_id = after_id.trim();
+        let component = after_id.split_whitespace().next().unwrap_or("");
+        let package = component.split('/').next().unwrap_or("").trim().to_string();
+        if package.is_empty() {
+            continue;
+        }
+        let bounds = after_id
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("bounds="))
+            .and_then(parse_rect_bounds)
+            .unwrap_or((0, 0, 0, 0));
+        let visible = after_id
+            .split_whitespace()
+            .any(|tok| tok == "visible=true");
+
+        tasks.push(AndroidTaskInfo {
+            task_id,
+            package,
+            bounds,
+            visible,
+        });
+    }
+    tasks
+}
+
+fn parse_rect_bounds(raw: &str) -> Option<(i32, i32, i32, i32)> {
+    // Format: [0,0][656,688]
+    let inner = raw.strip_prefix('[')?.strip_suffix(']')?;
+    let (lt, rb) = inner.split_once("][")?;
+    let (l_s, t_s) = lt.split_once(',')?;
+    let (r_s, b_s) = rb.split_once(',')?;
+    Some((
+        l_s.parse().ok()?,
+        t_s.parse().ok()?,
+        r_s.parse().ok()?,
+        b_s.parse().ok()?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_android_tasks_extracts_bounds_and_visibility() {
+        let sample = "\
+RootTask id=55 bounds=[0,0][656,688] displayId=0 userId=0
+  taskId=55: ai.iskra.mobile/ai.iskra.mobile.MainActivity bounds=[96,35][560,691] userId=0 visible=true topActivity=ComponentInfo{ai.iskra.mobile/ai.iskra.mobile.MainActivity}
+RootTask id=54 bounds=[0,0][656,688] displayId=0 userId=0
+  taskId=54: com.android.launcher3/.Launcher bounds=[0,0][656,688] userId=0 visible=false topActivity=ComponentInfo{com.android.launcher3/.Launcher}
+";
+        let tasks = parse_android_tasks(sample);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(
+            tasks[0],
+            AndroidTaskInfo {
+                task_id: 55,
+                package: "ai.iskra.mobile".to_string(),
+                bounds: (96, 35, 560, 691),
+                visible: true,
+            }
+        );
+        assert_eq!(tasks[1].task_id, 54);
+        assert_eq!(tasks[1].package, "com.android.launcher3");
+        assert!(!tasks[1].visible);
+    }
 }

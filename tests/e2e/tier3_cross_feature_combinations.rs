@@ -193,6 +193,7 @@ fn test_tier3_config_roundtrip_persistence() {
         display_mode: DisplayMode::SingleWindow,
         enable_gpu: true,
         enable_audio: false,
+        virtual_keyboard: false,
         system_image_url: "https://example.com/system.img".to_string(),
         vendor_image_url: "https://example.com/vendor.img".to_string(),
     };
@@ -203,5 +204,6 @@ fn test_tier3_config_roundtrip_persistence() {
     assert_eq!(parsed.display_mode, DisplayMode::SingleWindow);
     assert_eq!(parsed.enable_gpu, true);
     assert_eq!(parsed.enable_audio, false);
+    assert_eq!(parsed.virtual_keyboard, false);
     assert_eq!(parsed.system_image_url, "https://example.com/system.img");
 }

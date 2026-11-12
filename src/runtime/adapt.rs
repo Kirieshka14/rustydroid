@@ -7,10 +7,15 @@ use crate::apk::compat::{
     stage_bundle_artifacts, AbiStatus, AdaptationProfile, ApkBundleAnalyzer, BundleFormat,
     BundleInspection, ProfileOverrides, ProfileStore, SplitKind, WindowMode,
 };
+use crate::runtime::config::{AppConfig, ConfigManager};
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader, ErrorKind};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
 pub struct AdaptLaunchOptions {
@@ -177,8 +182,18 @@ pub fn apply_runtime_profile(serial: Option<&str>, profile: &AdaptationProfile) 
         sync_waydroid_prop(serial, k, v);
     }
 
-    // 5. Live window resolution / density scaling clamped cleanly to host display
+    // 5. Virtual keyboard (default OFF), smart resize flags, and live window geometry
+    let cfg = ConfigManager::load_or_default();
+    let vk_enabled = resolve_effective_virtual_keyboard(profile, &cfg);
     if let Some(ser) = serial {
+        if let Err(e) = AdbClient::sync_virtual_keyboard(ser, vk_enabled) {
+            eprintln!("⚠️  Не удалось синхронизировать экранную клавиатуру: {}", e);
+        }
+        let smart_resize = profile_supports_smart_resize(profile);
+        if let Err(e) = AdbClient::ensure_smart_resize_props(ser, smart_resize) {
+            eprintln!("⚠️  Не удалось применить настройки свободного ресайза: {}", e);
+        }
+
         let (host_w, host_h) = AdbClient::get_display_bounds(ser);
         let dims = resolve_window_dimensions(profile, host_w, host_h);
         if let Err(e) = AdbClient::apply_wm_geometry(ser, dims, profile.lcd_density) {
@@ -665,36 +680,44 @@ pub fn launch_adapted_app(
     if !is_waydroid_dbus_session_active() {
         if let Some(ser) = serial {
             AdbClient::launch_app_via_adb(ser, package, activity)?;
-            return Ok(());
+        }
+    } else {
+        AdbClient::unfreeze_waydroid_container();
+        let launch_out = Command::new("waydroid")
+            .args(["app", "launch", package])
+            .output()
+            .context("Не удалось выполнить waydroid app launch")?;
+        let stdout = String::from_utf8_lossy(&launch_out.stdout);
+        let stderr = String::from_utf8_lossy(&launch_out.stderr);
+
+        if !launch_out.status.success()
+            || waydroid_text_has_error(&stdout)
+            || waydroid_text_has_error(&stderr)
+        {
+            if let Some(ser) = serial {
+                eprintln!(
+                    "⚠️  waydroid app launch недоступен ({}), запускаем напрямую через ADB...",
+                    stderr.trim()
+                );
+                AdbClient::launch_app_via_adb(ser, package, activity)?;
+            } else {
+                bail!(
+                    "Не удалось запустить {} через Waydroid.\n{}\n{}",
+                    package,
+                    stdout.trim(),
+                    stderr.trim()
+                );
+            }
         }
     }
 
-    AdbClient::unfreeze_waydroid_container();
-    let launch_out = Command::new("waydroid")
-        .args(["app", "launch", package])
-        .output()
-        .context("Не удалось выполнить waydroid app launch")?;
-    let stdout = String::from_utf8_lossy(&launch_out.stdout);
-    let stderr = String::from_utf8_lossy(&launch_out.stderr);
-
-    if !launch_out.status.success()
-        || waydroid_text_has_error(&stdout)
-        || waydroid_text_has_error(&stderr)
-    {
-        if let Some(ser) = serial {
-            eprintln!(
-                "⚠️  waydroid app launch недоступен ({}), запускаем напрямую через ADB...",
-                stderr.trim()
-            );
-            AdbClient::launch_app_via_adb(ser, package, activity)?;
-            return Ok(());
+    if let Some(ser) = serial {
+        if profile_supports_smart_resize(profile) {
+            snap_launched_app_window(ser, package, profile.lcd_density);
         }
-        bail!(
-            "Не удалось запустить {} через Waydroid.\n{}\n{}",
-            package,
-            stdout.trim(),
-            stderr.trim()
-        );
+    }
+    if hyprland_socket2_path().is_some() {
+        ensure_window_sync_daemon_running();
     }
 
     Ok(())
@@ -780,6 +803,27 @@ pub fn print_profile_fields(p: &AdaptationProfile) {
         p.installer_spoof.as_deref().unwrap_or("none")
     );
     println!("  • Auto-grant:    {}", p.auto_grant_permissions);
+    let vk_str = match p.virtual_keyboard {
+        Some(true) => "ON (per-app)".to_string(),
+        Some(false) => "OFF (per-app)".to_string(),
+        None => {
+            let global_vk = ConfigManager::load_or_default().virtual_keyboard;
+            if global_vk {
+                "ON (global)".to_string()
+            } else {
+                "OFF (default)".to_string()
+            }
+        }
+    };
+    println!("  • Keyboard IME:  {}", vk_str);
+    println!(
+        "  • Smart Resize:  {}",
+        if profile_supports_smart_resize(p) {
+            "enabled (auto-fit Hyprland window)"
+        } else {
+            "disabled (fixed window mode/size)"
+        }
+    );
     if let Some(ref abi) = p.abi_override {
         println!("  • ABI Override:  {}", abi);
     }
@@ -828,6 +872,377 @@ pub fn inspect_target_or_package(
 
     let profile = ProfileStore::resolve_effective(target, None, overrides);
     Ok((target.to_string(), None, target.to_string(), None, profile))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyprWaydroidWindow {
+    pub package: String,
+    pub width: u32,
+    pub height: u32,
+    pub focused: bool,
+}
+
+/// Computes smart LCD density so narrow tiled windows retain readable >= 360dp width
+/// while standard desktop/fullscreen tiles keep crisp 180-220 dpi.
+pub fn compute_smart_density(win_w: u32, _win_h: u32) -> u32 {
+    if win_w < 405 {
+        ((win_w as f32 * 160.0) / 360.0)
+            .round()
+            .clamp(120.0, 180.0) as u32
+    } else if win_w <= 1600 {
+        180
+    } else {
+        220
+    }
+}
+
+/// Returns true when the profile uses automatic/freeform mode without fixed dimensions.
+pub fn profile_supports_smart_resize(profile: &AdaptationProfile) -> bool {
+    matches!(profile.window_mode, WindowMode::Auto | WindowMode::Freeform)
+        && profile.width.is_none()
+        && profile.height.is_none()
+}
+
+/// Resolves effective virtual keyboard state from per-app override -> global AppConfig (default false).
+pub fn resolve_effective_virtual_keyboard(profile: &AdaptationProfile, cfg: &AppConfig) -> bool {
+    profile.virtual_keyboard.unwrap_or(cfg.virtual_keyboard)
+}
+
+/// Parses `hyprctl clients -j` JSON output and extracts mapped `waydroid.<pkg>` app windows.
+/// Excludes `waydroid.InputMethod` and unmapped/zero-size windows.
+pub fn parse_hyprland_waydroid_clients(json_text: &str) -> Vec<HyprWaydroidWindow> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(json_text)
+    else {
+        return Vec::new();
+    };
+    let mut windows = Vec::new();
+    for item in items {
+        let mapped = item.get("mapped").and_then(|v| v.as_bool()).unwrap_or(true);
+        if !mapped {
+            continue;
+        }
+        let class = item.get("class").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(pkg) = class.strip_prefix("waydroid.") else {
+            continue;
+        };
+        if pkg.is_empty() || pkg.eq_ignore_ascii_case("InputMethod") {
+            continue;
+        }
+        let Some(size_arr) = item.get("size").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if size_arr.len() < 2 {
+            continue;
+        }
+        let w = size_arr[0].as_u64().unwrap_or(0) as u32;
+        let h = size_arr[1].as_u64().unwrap_or(0) as u32;
+        if w < 100 || h < 100 {
+            continue;
+        }
+        let focused = item
+            .get("focusHistoryID")
+            .and_then(|v| v.as_i64())
+            .map(|id| id == 0)
+            .unwrap_or(false);
+        windows.push(HyprWaydroidWindow {
+            package: pkg.to_string(),
+            width: w,
+            height: h,
+            focused,
+        });
+    }
+    windows
+}
+
+fn hyprland_socket2_path() -> Option<PathBuf> {
+    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    if sig.trim().is_empty() || runtime.trim().is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(runtime)
+        .join("hypr")
+        .join(sig)
+        .join(".socket2.sock");
+    path.exists().then_some(path)
+}
+
+fn query_hyprland_waydroid_windows() -> Vec<HyprWaydroidWindow> {
+    let Ok(out) = Command::new("hyprctl").args(["clients", "-j"]).output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_hyprland_waydroid_clients(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn apply_density_if_needed(
+    serial: &str,
+    target_dpi: u32,
+    last_density: &mut Option<u32>,
+) {
+    if last_density.is_none() {
+        *last_density = AdbClient::read_current_density(serial);
+    }
+    if *last_density != Some(target_dpi) && AdbClient::apply_density_only(serial, Some(target_dpi)).is_ok() {
+        *last_density = Some(target_dpi);
+    }
+}
+
+fn snap_launched_app_window(serial: &str, package: &str, fixed_dpi: Option<u32>) {
+    if hyprland_socket2_path().is_none() {
+        return;
+    }
+    let mut last_density = fixed_dpi;
+    for _ in 0..16 {
+        std::thread::sleep(Duration::from_millis(250));
+        let wins = query_hyprland_waydroid_windows();
+        let Some(win) = wins.iter().find(|w| w.package == package) else {
+            continue;
+        };
+        let Ok(tasks) = AdbClient::get_visible_tasks(serial) else {
+            continue;
+        };
+        let matching: Vec<_> = tasks.into_iter().filter(|t| t.package == package).collect();
+        if matching.is_empty() {
+            continue;
+        }
+        let target_bounds = (0, 0, win.width as i32, win.height as i32);
+        let mut snapped = false;
+        for t in matching {
+            if t.bounds != target_bounds {
+                if AdbClient::resize_task_bounds(serial, t.task_id, win.width, win.height).is_ok() {
+                    snapped = true;
+                }
+            } else {
+                snapped = true;
+            }
+        }
+        if snapped {
+            if fixed_dpi.is_none() {
+                let target_dpi = compute_smart_density(win.width, win.height);
+                apply_density_if_needed(serial, target_dpi, &mut last_density);
+            }
+            println!(
+                "📐 Умный размер окна {} адаптирован под Hyprland: {}x{}",
+                package, win.width, win.height
+            );
+            break;
+        }
+    }
+}
+
+fn ensure_window_sync_daemon_running() {
+    let unit_active = Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "rustydroid-window-sync.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if unit_active {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let systemd_ok = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--quiet",
+            "--collect",
+            "--unit=rustydroid-window-sync",
+            "--description=RustyDroid Hyprland to Android dynamic window sync",
+        ])
+        .arg(&exe)
+        .arg("internal-window-sync")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !systemd_ok {
+        let _ = Command::new(&exe)
+            .arg("internal-window-sync")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+fn is_hypr_layout_event(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "openwindow>>",
+        "closewindow>>",
+        "resizewindow>>",
+        "fullscreen>>",
+        "changefloatingmode>>",
+        "movewindow>>",
+        "movewindowv2>>",
+        "workspace>>",
+        "workspacev2>>",
+        "submap>>",
+    ];
+    PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
+/// Background event loop (invoked via `rustydroid internal-window-sync`) that listens read-only
+/// to Hyprland's `.socket2.sock` and keeps smart-resize Waydroid tasks fitted to their Hyprland tiles.
+pub fn run_hyprland_window_sync_loop() -> Result<()> {
+    let Some(sock_path) = hyprland_socket2_path() else {
+        return Ok(());
+    };
+    let stream = UnixStream::connect(&sock_path)
+        .with_context(|| format!("Не удалось подключиться к {}", sock_path.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream);
+
+    let mut synced_sizes: HashMap<String, (u32, u32)> = HashMap::new();
+    let mut last_density: Option<u32> = None;
+    let mut cached_serial: Option<String> = None;
+
+    // Perform an initial sync pass in case a Waydroid window is already open.
+    sync_changed_waydroid_windows(&mut synced_sizes, &mut last_density, &mut cached_serial);
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // Hyprland socket closed
+            Ok(_) => {
+                if !is_hypr_layout_event(&line) {
+                    continue;
+                }
+                // Debounce rapid bursts (tile recalculation / fullscreen transitions)
+                std::thread::sleep(Duration::from_millis(80));
+                let _ = reader
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_millis(10)));
+                let mut tmp = String::new();
+                for _ in 0..32 {
+                    tmp.clear();
+                    match reader.read_line(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                let _ = reader
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(10)));
+
+                sync_changed_waydroid_windows(
+                    &mut synced_sizes,
+                    &mut last_density,
+                    &mut cached_serial,
+                );
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if !is_waydroid_dbus_session_active() {
+                    break;
+                }
+                // Catch cases where a resize completed slightly after initial launch
+                sync_changed_waydroid_windows(
+                    &mut synced_sizes,
+                    &mut last_density,
+                    &mut cached_serial,
+                );
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+fn sync_changed_waydroid_windows(
+    synced_sizes: &mut HashMap<String, (u32, u32)>,
+    last_density: &mut Option<u32>,
+    cached_serial: &mut Option<String>,
+) {
+    let windows = query_hyprland_waydroid_windows();
+    synced_sizes.retain(|pkg, _| windows.iter().any(|w| &w.package == pkg));
+
+    let changed: Vec<HyprWaydroidWindow> = windows
+        .into_iter()
+        .filter(|w| synced_sizes.get(&w.package) != Some(&(w.width, w.height)))
+        .collect();
+    if changed.is_empty() {
+        return;
+    }
+
+    // Filter out apps whose saved profile locks fixed window mode/dimensions BEFORE touching ADB.
+    let eligible: Vec<(HyprWaydroidWindow, Option<u32>)> = changed
+        .into_iter()
+        .filter_map(|w| {
+            let saved = ProfileStore::load(&w.package);
+            let allows_smart = saved
+                .as_ref()
+                .map(profile_supports_smart_resize)
+                .unwrap_or(true);
+            if allows_smart {
+                Some((w, saved.and_then(|p| p.lcd_density)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if eligible.is_empty() {
+        return;
+    }
+
+    let tasks = if let Some(ref ser) = *cached_serial {
+        match AdbClient::get_visible_tasks(ser) {
+            Ok(t) => t,
+            Err(_) => {
+                *cached_serial = try_connect_waydroid_adb_with_retry(2, 150);
+                let Some(ref new_ser) = *cached_serial else {
+                    return;
+                };
+                match AdbClient::get_visible_tasks(new_ser) {
+                    Ok(t) => t,
+                    Err(_) => return,
+                }
+            }
+        }
+    } else {
+        *cached_serial = try_connect_waydroid_adb_with_retry(2, 150);
+        let Some(ref ser) = *cached_serial else {
+            return;
+        };
+        match AdbClient::get_visible_tasks(ser) {
+            Ok(t) => t,
+            Err(_) => return,
+        }
+    };
+    let Some(serial) = cached_serial.clone() else {
+        return;
+    };
+
+    for (win, fixed_dpi) in eligible {
+        let matching: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.package == win.package)
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
+        let target_bounds = (0, 0, win.width as i32, win.height as i32);
+        let mut all_ok = true;
+        for t in matching {
+            if t.bounds != target_bounds
+                && AdbClient::resize_task_bounds(&serial, t.task_id, win.width, win.height)
+                    .is_err()
+            {
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            synced_sizes.insert(win.package.clone(), (win.width, win.height));
+            if win.focused && fixed_dpi.is_none() {
+                let target_dpi = compute_smart_density(win.width, win.height);
+                apply_density_if_needed(&serial, target_dpi, last_density);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -900,5 +1315,58 @@ mod tests {
         assert!(!parse_boot_readiness(Some("1"), Some("0")));
         assert!(parse_boot_readiness(Some("1"), Some("true")));
         assert!(parse_boot_readiness(Some("1\n"), None));
+    }
+
+    #[test]
+    fn test_compute_smart_density() {
+        assert_eq!(compute_smart_density(320, 688), 142);
+        assert_eq!(compute_smart_density(250, 688), 120);
+        assert_eq!(compute_smart_density(656, 688), 180);
+        assert_eq!(compute_smart_density(1366, 768), 180);
+        assert_eq!(compute_smart_density(1920, 1080), 220);
+    }
+
+    #[test]
+    fn test_parse_hyprland_waydroid_clients() {
+        let sample = r#"[
+            {"class":"kitty","mapped":true,"size":[656,688],"focusHistoryID":1},
+            {"class":"waydroid.InputMethod","mapped":true,"size":[656,338],"focusHistoryID":2},
+            {"class":"waydroid.ai.iskra.mobile","mapped":true,"size":[656,688],"focusHistoryID":0},
+            {"class":"waydroid.com.example","mapped":false,"size":[656,688],"focusHistoryID":3}
+        ]"#;
+        let wins = parse_hyprland_waydroid_clients(sample);
+        assert_eq!(
+            wins,
+            vec![HyprWaydroidWindow {
+                package: "ai.iskra.mobile".to_string(),
+                width: 656,
+                height: 688,
+                focused: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_profile_supports_smart_resize_and_vk_resolution() {
+        let mut profile = AdaptationProfile::default();
+        profile.package_name = "com.test".to_string();
+        assert!(profile_supports_smart_resize(&profile));
+
+        profile.window_mode = WindowMode::PhonePortrait;
+        assert!(!profile_supports_smart_resize(&profile));
+
+        profile.window_mode = WindowMode::Freeform;
+        profile.width = Some(540);
+        assert!(!profile_supports_smart_resize(&profile));
+
+        profile.width = None;
+        assert!(profile_supports_smart_resize(&profile));
+
+        let mut cfg = AppConfig::default();
+        assert!(!resolve_effective_virtual_keyboard(&profile, &cfg));
+        cfg.virtual_keyboard = true;
+        assert!(resolve_effective_virtual_keyboard(&profile, &cfg));
+        profile.virtual_keyboard = Some(false);
+        assert!(!resolve_effective_virtual_keyboard(&profile, &cfg));
     }
 }
