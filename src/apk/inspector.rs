@@ -45,7 +45,13 @@ impl ApkInspector {
             .with_context(|| format!("Failed to open APK file: {}", path_ref.display()))?;
         let mut archive = ZipArchive::new(file)
             .with_context(|| "Failed to read APK as ZIP archive")?;
+        Self::inspect_archive(path_ref, &mut archive)
+    }
 
+    pub fn inspect_archive<R: Read + std::io::Seek>(
+        path_ref: &Path,
+        archive: &mut ZipArchive<R>,
+    ) -> Result<ApkMetadata> {
         // 1. Read and parse AndroidManifest.xml
         let manifest_bytes = {
             let mut manifest_file = archive
@@ -70,17 +76,23 @@ impl ApkInspector {
         let mut main_activity = None;
         let mut permissions = Vec::new();
 
-        // Check uses-permission
-        for child in root.find_children("uses-permission") {
+        // Check uses-permission and uses-permission-sdk-23
+        for child in root
+            .find_children("uses-permission")
+            .into_iter()
+            .chain(root.find_children("uses-permission-sdk-23"))
+        {
             if let Some(perm) = child.get_attr("name", string_pool) {
-                permissions.push(perm);
+                if !permissions.contains(&perm) {
+                    permissions.push(perm);
+                }
             }
         }
 
         // Check application tag
         for app in root.find_children("application") {
             if let Some(lbl) = app.get_attr("label", string_pool) {
-                if !lbl.starts_with('@') {
+                if !lbl.starts_with('@') && !lbl.is_empty() {
                     app_label = Some(lbl);
                 }
             }
@@ -194,8 +206,9 @@ impl ApkInspector {
             }
         }
 
-        // If not found in standard paths, search all zip entries for ic_launcher or icon
+        // If not found in standard paths, search all zip entries prioritizing res/ and ic_launcher
         if icon_data.is_none() {
+            let mut best_score = 0u8;
             for i in 0..archive.len() {
                 if let Ok(mut file) = archive.by_index(i) {
                     let name = file.name().to_string();
@@ -203,11 +216,23 @@ impl ApkInspector {
                     if (lower.contains("ic_launcher") || lower.contains("icon"))
                         && (lower.ends_with(".png") || lower.ends_with(".webp"))
                     {
-                        let mut buf = Vec::new();
-                        if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                            icon_path_in_apk = Some(name);
-                            icon_data = Some(buf);
-                            break;
+                        let score = if lower.starts_with("res/") && lower.contains("ic_launcher") {
+                            3
+                        } else if lower.starts_with("res/") {
+                            2
+                        } else {
+                            1
+                        };
+                        if score > best_score {
+                            let mut buf = Vec::new();
+                            if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                                best_score = score;
+                                icon_path_in_apk = Some(name);
+                                icon_data = Some(buf);
+                                if best_score == 3 {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

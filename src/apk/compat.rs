@@ -407,10 +407,17 @@ fn is_language_code(s: &str) -> bool {
         return true;
     }
     if let Some((lang, region)) = s.split_once('_').or_else(|| s.split_once('-')) {
-        return (2..=3).contains(&lang.len())
-            && lang.bytes().all(|b| b.is_ascii_lowercase())
-            && (2..=4).contains(&region.len())
-            && region.bytes().all(|b| b.is_ascii_alphanumeric());
+        let valid_lang = (2..=3).contains(&lang.len()) && lang.bytes().all(|b| b.is_ascii_lowercase());
+        if !valid_lang {
+            return false;
+        }
+        let valid_region = (region.len() == 2 && region.bytes().all(|b| b.is_ascii_alphabetic()))
+            || (region.len() == 3
+                && region.starts_with('r')
+                && region.as_bytes()[1..].iter().all(|b| b.is_ascii_alphabetic()))
+            || (region.len() == 3 && region.bytes().all(|b| b.is_ascii_digit()))
+            || matches!(region, "hans" | "hant" | "latn" | "cyrl" | "arab");
+        return valid_region;
     }
     false
 }
@@ -489,6 +496,48 @@ fn read_zip_entry_bytes<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str,
     Ok(buf)
 }
 
+enum ZipBacking {
+    Memory(Cursor<Vec<u8>>),
+    TempFile(File),
+}
+
+impl Read for ZipBacking {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Memory(c) => c.read(buf),
+            Self::TempFile(f) => f.read(buf),
+        }
+    }
+}
+
+impl Seek for ZipBacking {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::Memory(c) => c.seek(pos),
+            Self::TempFile(f) => f.seek(pos),
+        }
+    }
+}
+
+fn open_inner_apk_backing<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entry_name: &str,
+) -> Result<ZipBacking> {
+    let mut entry = archive
+        .by_name(entry_name)
+        .with_context(|| format!("Archive entry '{}' not found", entry_name))?;
+    if entry.size() as usize <= MAX_IN_MEMORY_BASE_APK_BYTES {
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut buf)?;
+        Ok(ZipBacking::Memory(Cursor::new(buf)))
+    } else {
+        let mut tmp = tempfile::tempfile().context("Failed to allocate temp file for large inner APK")?;
+        std::io::copy(&mut entry, &mut tmp)?;
+        tmp.seek(std::io::SeekFrom::Start(0))?;
+        Ok(ZipBacking::TempFile(tmp))
+    }
+}
+
 fn inspect_bundle_archive(
     source_path: &Path,
     archive: &mut ZipArchive<File>,
@@ -549,17 +598,21 @@ fn inspect_bundle_archive(
         .map(|m| {
             m.split_apks
                 .iter()
-                .map(|s| (s.file.clone(), s.id.clone()))
+                .map(|s| {
+                    let norm_file = s.file.strip_prefix("./").unwrap_or(&s.file).to_string();
+                    (norm_file, s.id.clone())
+                })
                 .collect()
         })
         .unwrap_or_default();
 
-    let mut base_candidate: Option<(String, Vec<u8>)> = None;
+    let mut base_candidate: Option<(String, ZipBacking)> = None;
     let mut splits: Vec<ApkBundleEntry> = Vec::new();
     let mut split_abis_collected: BTreeSet<String> = BTreeSet::new();
     let mut split_engines: Vec<String> = Vec::new();
 
     apk_entries_raw.sort_by_key(|(name, _)| {
+        let lookup_name = name.strip_prefix("./").unwrap_or(name);
         let fname = Path::new(name)
             .file_name()
             .and_then(|s| s.to_str())
@@ -567,7 +620,7 @@ fn inspect_bundle_archive(
             .to_ascii_lowercase();
         let priority = if fname == "base.apk" || fname == "base-master.apk" {
             0
-        } else if xapk_split_ids.get(name).map(|id| id == "base").unwrap_or(false) {
+        } else if xapk_split_ids.get(lookup_name).map(|id| id == "base").unwrap_or(false) {
             1
         } else if !fname.contains("config.") && !fname.starts_with("split_") {
             2
@@ -578,11 +631,12 @@ fn inspect_bundle_archive(
     });
 
     for (entry_name, size_bytes) in apk_entries_raw {
-        let apk_bytes = read_zip_entry_bytes(archive, &entry_name, MAX_IN_MEMORY_BASE_APK_BYTES)?;
-        let mut inner_zip = ZipArchive::new(Cursor::new(&apk_bytes))
-            .with_context(|| format!("Invalid inner APK '{}'", entry_name))?;
-
-        let (split_attr, abis, engine) = peek_inner_apk(&mut inner_zip)?;
+        let mut backing = open_inner_apk_backing(archive, &entry_name)?;
+        let (split_attr, abis, engine) = {
+            let mut inner_zip = ZipArchive::new(&mut backing)
+                .with_context(|| format!("Invalid inner APK '{}'", entry_name))?;
+            peek_inner_apk(&mut inner_zip)?
+        };
         for a in abis {
             split_abis_collected.insert(a);
         }
@@ -592,9 +646,12 @@ fn inspect_bundle_archive(
             }
         }
 
+        let lookup_name = entry_name.strip_prefix("./").unwrap_or(&entry_name);
+        let xapk_id = xapk_split_ids.get(lookup_name);
+
         let inferred_kind = if let Some(ref sp) = split_attr {
             classify_split_tag(sp)
-        } else if let Some(id) = xapk_split_ids.get(&entry_name) {
+        } else if let Some(id) = xapk_id {
             classify_split_tag(id)
         } else {
             classify_split_tag(&entry_name)
@@ -610,16 +667,14 @@ fn inspect_bundle_archive(
             || file_lower.starts_with("split_");
 
         let is_explicit_base = matches!(inferred_kind, SplitKind::Base)
-            || xapk_split_ids
-                .get(&entry_name)
-                .map(|id| id == "base")
-                .unwrap_or(false)
+            || xapk_id.map(|id| id == "base").unwrap_or(false)
             || (base_candidate.is_none()
                 && split_attr.is_none()
+                && xapk_id.is_none()
                 && !is_named_split
                 && !matches!(
                     inferred_kind,
-                    SplitKind::Abi(_) | SplitKind::Density(_) | SplitKind::Language(_)
+                    SplitKind::Abi(_) | SplitKind::Density(_)
                 ));
 
         let kind = if is_explicit_base {
@@ -633,7 +688,8 @@ fn inspect_bundle_archive(
         }
 
         if is_explicit_base && base_candidate.is_none() {
-            base_candidate = Some((entry_name.clone(), apk_bytes));
+            backing.seek(std::io::SeekFrom::Start(0))?;
+            base_candidate = Some((entry_name.clone(), backing));
         }
 
         splits.push(ApkBundleEntry {
@@ -644,18 +700,18 @@ fn inspect_bundle_archive(
         });
     }
 
-    let (base_name, base_bytes) = match base_candidate {
+    let (base_name, base_backing) = match base_candidate {
         Some(found) => found,
         None => {
             let fallback_name = splits[0].entry_name.clone();
             splits[0].kind = SplitKind::Base;
-            let bytes = read_zip_entry_bytes(archive, &fallback_name, MAX_IN_MEMORY_BASE_APK_BYTES)?;
-            (fallback_name, bytes)
+            let backing = open_inner_apk_backing(archive, &fallback_name)?;
+            (fallback_name, backing)
         }
     };
 
-    let mut base_zip = ZipArchive::new(Cursor::new(&base_bytes))?;
-    let mut metadata = inspect_zip_metadata(source_path, &mut base_zip)?;
+    let mut base_zip = ZipArchive::new(base_backing)?;
+    let mut metadata = ApkInspector::inspect_archive(source_path, &mut base_zip)?;
 
     // Enrich metadata from bundle JSON manifests when AXML resources use references (@0x...).
     if let Some(ref xm) = xapk_manifest {
@@ -676,7 +732,10 @@ fn inspect_bundle_archive(
             metadata.version_code = xm.version_code.as_ref().map(json_value_to_string);
         }
         for exp in &xm.expansions {
-            if let Some(existing) = obb_entries.iter_mut().find(|o| o.entry_name == exp.file) {
+            let norm_exp = exp.file.strip_prefix("./").unwrap_or(&exp.file);
+            if let Some(existing) = obb_entries.iter_mut().find(|o| {
+                o.entry_name == exp.file || o.entry_name.strip_prefix("./").unwrap_or(&o.entry_name) == norm_exp
+            }) {
                 if !exp.install_path.is_empty() {
                     existing.install_rel_path = exp.install_path.clone();
                 }
@@ -776,73 +835,6 @@ fn peek_inner_apk<R: Read + Seek>(
     Ok((split_attr, abis, engine))
 }
 
-fn inspect_zip_metadata<R: Read + Seek>(source_path: &Path, archive: &mut ZipArchive<R>) -> Result<ApkMetadata> {
-    let manifest_bytes = read_zip_entry_bytes(archive, "AndroidManifest.xml", 16 * 1024 * 1024)?;
-    let mut parser = AxmlParser::new(&manifest_bytes);
-    let root = parser.parse()?;
-    let pool = parser.string_pool();
-
-    let package_name = root
-        .get_attr("package", pool)
-        .unwrap_or_else(|| "unknown.package".to_string());
-    let version_code = root.get_attr("versionCode", pool);
-    let version_name = root.get_attr("versionName", pool);
-
-    let permissions = root
-        .find_children("uses-permission")
-        .into_iter()
-        .filter_map(|c| c.get_attr("name", pool))
-        .collect::<Vec<_>>();
-
-    let mut app_label = None;
-    let mut main_activity = None;
-    for app in root.find_children("application") {
-        if let Some(lbl) = app.get_attr("label", pool) {
-            if !lbl.starts_with('@') && !lbl.is_empty() {
-                app_label = Some(lbl);
-            }
-        }
-        for act in app
-            .find_children("activity")
-            .into_iter()
-            .chain(app.find_children("activity-alias"))
-        {
-            if is_launcher_activity(act, pool) && main_activity.is_none() {
-                if let Some(act_name) = act
-                    .get_attr("name", pool)
-                    .or_else(|| act.get_attr("targetActivity", pool))
-                {
-                    let norm = ApkInspector::normalize_activity_name(&package_name, &act_name);
-                    if !norm.is_empty() {
-                        main_activity = Some(norm);
-                    }
-                }
-            }
-        }
-    }
-
-    let (icon_path_in_apk, icon_data) = extract_best_icon(archive);
-    let label = app_label.unwrap_or_else(|| {
-        package_name
-            .split('.')
-            .last()
-            .unwrap_or("Android App")
-            .to_string()
-    });
-
-    Ok(ApkMetadata {
-        file_path: source_path.to_string_lossy().to_string(),
-        package_name,
-        version_code,
-        version_name,
-        app_label: Some(label),
-        main_activity,
-        permissions,
-        icon_path_in_apk,
-        icon_data,
-    })
-}
-
 fn is_launcher_activity(act: &AxmlElement, pool: &[String]) -> bool {
     for filter in act.find_children("intent-filter") {
         let is_main = filter
@@ -858,48 +850,6 @@ fn is_launcher_activity(act: &AxmlElement, pool: &[String]) -> bool {
         }
     }
     false
-}
-
-fn extract_best_icon<R: Read + Seek>(archive: &mut ZipArchive<R>) -> (Option<String>, Option<Vec<u8>>) {
-    let icon_candidates = [
-        "res/mipmap-xxxhdpi-v4/ic_launcher.png",
-        "res/mipmap-xxxhdpi/ic_launcher.png",
-        "res/mipmap-xxhdpi-v4/ic_launcher.png",
-        "res/mipmap-xxhdpi/ic_launcher.png",
-        "res/mipmap-xhdpi-v4/ic_launcher.png",
-        "res/mipmap-xhdpi/ic_launcher.png",
-        "res/mipmap-hdpi-v4/ic_launcher.png",
-        "res/mipmap-hdpi/ic_launcher.png",
-        "res/mipmap-mdpi-v4/ic_launcher.png",
-        "res/mipmap-mdpi/ic_launcher.png",
-        "res/drawable-xxxhdpi-v4/ic_launcher.png",
-        "res/drawable-xxhdpi-v4/ic_launcher.png",
-        "res/drawable-xhdpi-v4/ic_launcher.png",
-        "res/drawable/ic_launcher.png",
-    ];
-    for candidate in icon_candidates {
-        if let Ok(mut f) = archive.by_name(candidate) {
-            let mut buf = Vec::new();
-            if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                return (Some(candidate.to_string()), Some(buf));
-            }
-        }
-    }
-    for i in 0..archive.len() {
-        if let Ok(mut f) = archive.by_index(i) {
-            let name = f.name().to_string();
-            let lower = name.to_ascii_lowercase();
-            if (lower.contains("ic_launcher") || lower.contains("icon"))
-                && (lower.ends_with(".png") || lower.ends_with(".webp"))
-            {
-                let mut buf = Vec::new();
-                if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                    return (Some(name), Some(buf));
-                }
-            }
-        }
-    }
-    (None, None)
 }
 
 fn analyze_apk_archive<R: Read + Seek>(
@@ -1136,7 +1086,13 @@ fn build_compat_warnings(report: &ApkCompatibilityReport, _base_name: Option<&st
 }
 
 fn parse_u32_attr(elem: &AxmlElement, attr: &str, pool: &[String]) -> Option<u32> {
-    elem.get_attr(attr, pool)?.trim().parse::<u32>().ok()
+    let raw = elem.get_attr(attr, pool)?;
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u32>().ok()
+    }
 }
 
 fn parse_bool_attr(elem: &AxmlElement, attr: &str, pool: &[String]) -> Option<bool> {
@@ -1199,6 +1155,14 @@ impl AdaptationProfile {
     pub fn apply_overrides(&mut self, overrides: &ProfileOverrides) {
         if let Some(mode) = overrides.window_mode {
             self.window_mode = mode;
+            if mode != WindowMode::CustomSize {
+                if overrides.width.is_none() {
+                    self.width = None;
+                }
+                if overrides.height.is_none() {
+                    self.height = None;
+                }
+            }
         }
         if let Some(w) = overrides.width {
             self.width = Some(w);
@@ -1488,12 +1452,26 @@ pub fn stage_bundle_artifacts(
         let mut entry = archive
             .by_name(&obb.entry_name)
             .with_context(|| format!("Missing OBB '{}' in archive", obb.entry_name))?;
-        let obb_stage_dir = staging_dir.join("obb").join(&obb.package_name);
+        let safe_pkg = super::desktop::sanitize_package_name(&obb.package_name);
+        let base_obb_name = Path::new(&obb.file_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("main.obb");
+        let safe_obb_name: String = base_obb_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .collect();
+        let safe_obb_name = if safe_obb_name.is_empty() || safe_obb_name == "." || safe_obb_name == ".." {
+            "main.obb".to_string()
+        } else {
+            safe_obb_name
+        };
+        let obb_stage_dir = staging_dir.join("obb").join(&safe_pkg);
         fs::create_dir_all(&obb_stage_dir)?;
-        let host_obb = obb_stage_dir.join(&obb.file_name);
+        let host_obb = obb_stage_dir.join(&safe_obb_name);
         let mut out = File::create(&host_obb)?;
         std::io::copy(&mut entry, &mut out)?;
-        let remote_path = format!("/sdcard/Android/obb/{}/{}", obb.package_name, obb.file_name);
+        let remote_path = format!("/sdcard/Android/obb/{}/{}", safe_pkg, safe_obb_name);
         obb_files.push((host_obb, remote_path));
     }
 
@@ -1769,5 +1747,89 @@ mod tests {
         let abi = classify_pm_install_failure("Failure [INSTALL_FAILED_NO_MATCHING_ABIS: Failed to extract native libraries]");
         assert!(!abi.retry_with_downgrade);
         assert!(abi.summary.contains("setup-arm"));
+    }
+
+    #[test]
+    fn test_non_locale_splits_not_misclassified_as_language() {
+        assert_eq!(
+            classify_split_tag("my_game.apk"),
+            SplitKind::Feature("my_game".to_string())
+        );
+        assert_eq!(
+            classify_split_tag("ar_core.apk"),
+            SplitKind::Feature("ar_core".to_string())
+        );
+        assert_eq!(
+            classify_split_tag("ui_main.apk"),
+            SplitKind::Feature("ui_main".to_string())
+        );
+        assert_eq!(
+            classify_split_tag("app-test.apk"),
+            SplitKind::Feature("app-test".to_string())
+        );
+        assert_eq!(
+            classify_split_tag("split_config.en-rUS.apk"),
+            SplitKind::Language("en-rus".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_overrides_clears_stale_custom_dimensions() {
+        let mut profile = AdaptationProfile::default();
+        profile.apply_overrides(&ProfileOverrides {
+            window_mode: Some(WindowMode::CustomSize),
+            width: Some(1200),
+            height: Some(800),
+            ..Default::default()
+        });
+        assert_eq!(profile.window_mode, WindowMode::CustomSize);
+        assert_eq!((profile.width, profile.height), (Some(1200), Some(800)));
+
+        profile.apply_overrides(&ProfileOverrides {
+            window_mode: Some(WindowMode::PhonePortrait),
+            ..Default::default()
+        });
+        assert_eq!(profile.window_mode, WindowMode::PhonePortrait);
+        assert_eq!((profile.width, profile.height), (None, None));
+    }
+
+    #[test]
+    fn test_parse_u32_attr_supports_hex_and_dec() {
+        use crate::apk::axml::{AxmlAttribute, AxmlElement};
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "minSdkVersion".to_string(),
+            AxmlAttribute {
+                uri: String::new(),
+                name: "minSdkVersion".to_string(),
+                value_str: Some("26".to_string()),
+                data_type: 16,
+                data: 26,
+            },
+        );
+        let dec_elem = AxmlElement {
+            name: "uses-sdk".to_string(),
+            attributes: attrs,
+            children: Vec::new(),
+        };
+        assert_eq!(parse_u32_attr(&dec_elem, "minSdkVersion", &[]), Some(26));
+
+        let mut hex_attrs = std::collections::HashMap::new();
+        hex_attrs.insert(
+            "minSdkVersion".to_string(),
+            AxmlAttribute {
+                uri: String::new(),
+                name: "minSdkVersion".to_string(),
+                value_str: Some("0x1a".to_string()),
+                data_type: 3,
+                data: 0,
+            },
+        );
+        let hex_elem = AxmlElement {
+            name: "uses-sdk".to_string(),
+            attributes: hex_attrs,
+            children: Vec::new(),
+        };
+        assert_eq!(parse_u32_attr(&hex_elem, "minSdkVersion", &[]), Some(26));
     }
 }

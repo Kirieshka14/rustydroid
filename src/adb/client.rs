@@ -419,8 +419,10 @@ impl AdbClient {
                     warnings.push(diag.summary);
                     continue;
                 }
-                if (combined.contains("Unknown option --force-sdk")
-                    || combined.contains("Unknown option --bypass-low-target-sdk-block"))
+                let lower_combined = combined.to_ascii_lowercase();
+                if lower_combined.contains("unknown option")
+                    && (lower_combined.contains("--force-sdk")
+                        || lower_combined.contains("--bypass-low-target-sdk-block"))
                     && (opts.force_sdk || opts.bypass_low_target_sdk_block)
                 {
                     if opts.force_sdk {
@@ -481,7 +483,37 @@ impl AdbClient {
         let mut full_args = vec!["-s", serial, "shell"];
         full_args.extend_from_slice(cmd_args);
         let out = Self::run_adb_with_timeout(&full_args, 10)?;
+        if out.status.code() == Some(124) {
+            bail!("adb shell timed out for {}", serial);
+        }
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let err_lower = err.to_ascii_lowercase();
+            let is_adb_transport_err = err_lower.contains("error:")
+                || err_lower.contains("device offline")
+                || err_lower.contains("device not found")
+                || err_lower.contains("no devices")
+                || err_lower.contains("closed")
+                || err_lower.contains("daemon not running");
+            if is_adb_transport_err {
+                bail!("adb shell transport error for {}: {}", serial, err.trim());
+            }
+        }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    pub fn interactive_shell(serial: Option<&str>) -> Result<()> {
+        Self::unfreeze_waydroid_container();
+        let mut cmd = std::process::Command::new("adb");
+        if let Some(ser) = serial {
+            cmd.args(["-s", ser]);
+        }
+        cmd.arg("shell");
+        let status = cmd.status()?;
+        if !status.success() {
+            bail!("adb interactive shell exited with {:?}", status.code());
+        }
+        Ok(())
     }
 
     pub fn get_prop(serial: &str, key: &str) -> Option<String> {
@@ -583,8 +615,9 @@ impl AdbClient {
                 "1",
             ],
         )?;
-        if out.contains("No activities found") {
-            bail!("No LAUNCHER activity found for {}", package);
+        let out_lower = out.to_ascii_lowercase();
+        if out_lower.contains("no activities found") || out_lower.contains("monkey aborted") {
+            bail!("Failed to launch {} via monkey: {}", package, out.trim());
         }
         Ok(())
     }

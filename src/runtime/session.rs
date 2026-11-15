@@ -62,7 +62,7 @@ impl SessionManager {
     }
 
     pub fn check_pid_alive(pid: u32) -> bool {
-        if pid == 0 {
+        if pid == 0 || pid > i32::MAX as u32 {
             return false;
         }
 
@@ -182,29 +182,32 @@ done
     pub fn stop_session() -> Result<()> {
         let path = Self::get_session_file();
         if let Some(state) = Self::get_state() {
-            let nix_pid = Pid::from_raw(state.pid as i32);
-            let _ = kill(nix_pid, Signal::SIGTERM);
-            let _ = kill(Pid::from_raw(-(state.pid as i32)), Signal::SIGTERM);
+            if state.pid > 0 && state.pid <= i32::MAX as u32 {
+                let raw_pid = state.pid as i32;
+                let nix_pid = Pid::from_raw(raw_pid);
+                let _ = kill(nix_pid, Signal::SIGTERM);
+                let _ = kill(Pid::from_raw(-raw_pid), Signal::SIGTERM);
 
-            // Wait up to 2 seconds for graceful shutdown
-            for _ in 0..20 {
-                unsafe {
-                    let mut st: libc::c_int = 0;
-                    let _ = libc::waitpid(state.pid as i32, &mut st, libc::WNOHANG);
+                // Wait up to 2 seconds for graceful shutdown
+                for _ in 0..20 {
+                    unsafe {
+                        let mut st: libc::c_int = 0;
+                        let _ = libc::waitpid(raw_pid, &mut st, libc::WNOHANG);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                    if !Self::check_pid_alive(state.pid) {
+                        break;
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(100));
-                if !Self::check_pid_alive(state.pid) {
-                    break;
-                }
-            }
 
-            if Self::check_pid_alive(state.pid) {
-                let _ = kill(nix_pid, Signal::SIGKILL);
-                let _ = kill(Pid::from_raw(-(state.pid as i32)), Signal::SIGKILL);
-                std::thread::sleep(Duration::from_millis(50));
-                unsafe {
-                    let mut st: libc::c_int = 0;
-                    let _ = libc::waitpid(state.pid as i32, &mut st, libc::WNOHANG);
+                if Self::check_pid_alive(state.pid) {
+                    let _ = kill(nix_pid, Signal::SIGKILL);
+                    let _ = kill(Pid::from_raw(-raw_pid), Signal::SIGKILL);
+                    std::thread::sleep(Duration::from_millis(50));
+                    unsafe {
+                        let mut st: libc::c_int = 0;
+                        let _ = libc::waitpid(raw_pid, &mut st, libc::WNOHANG);
+                    }
                 }
             }
         }
@@ -214,5 +217,17 @@ done
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_pid_alive_rejects_zero_and_i32_overflow() {
+        assert!(!SessionManager::check_pid_alive(0));
+        assert!(!SessionManager::check_pid_alive(u32::MAX));
+        assert!(!SessionManager::check_pid_alive((i32::MAX as u32) + 1));
     }
 }

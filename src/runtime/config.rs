@@ -39,12 +39,25 @@ impl Default for AppConfig {
 pub struct ConfigManager;
 
 impl ConfigManager {
+    fn non_empty_env_path(key: &str) -> Option<PathBuf> {
+        std::env::var_os(key)
+            .map(|v| v.to_string_lossy().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    }
+
     pub fn get_config_dir() -> PathBuf {
+        if let Some(xdg) = Self::non_empty_env_path("XDG_CONFIG_HOME") {
+            return xdg.join("rustydroid");
+        }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(home).join(".config/rustydroid")
     }
 
     pub fn get_data_dir() -> PathBuf {
+        if let Some(xdg) = Self::non_empty_env_path("XDG_DATA_HOME") {
+            return xdg.join("rustydroid");
+        }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(home).join(".local/share/rustydroid")
     }
@@ -57,6 +70,7 @@ impl ConfigManager {
                     return cfg;
                 }
             }
+            return AppConfig::default();
         }
         let cfg = AppConfig::default();
         let _ = Self::save(&cfg);

@@ -286,7 +286,10 @@ fn find_runner_setup_script() -> Option<PathBuf> {
 }
 
 fn normalize_path_str(raw: &str) -> String {
-    let unescaped = if let Some(stripped) = raw.strip_prefix("file://") {
+    let unescaped = if let Some(stripped) = raw
+        .strip_prefix("file://localhost")
+        .or_else(|| raw.strip_prefix("file://"))
+    {
         percent_decode(stripped)
     } else {
         raw.to_string()
@@ -295,18 +298,21 @@ fn normalize_path_str(raw: &str) -> String {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut bytes = Vec::new();
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            if let (Some(h1), Some(h2)) = (chars.next(), chars.next()) {
-                if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or(""), 16) {
+    let src = s.as_bytes();
+    let mut bytes = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'%' && i + 2 < src.len() {
+            if let Ok(hex) = std::str::from_utf8(&src[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex, 16) {
                     bytes.push(val);
+                    i += 3;
                     continue;
                 }
             }
         }
-        bytes.push(b);
+        bytes.push(src[i]);
+        i += 1;
     }
     String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
 }
@@ -352,6 +358,7 @@ fn wait_for_android_boot_ready(
     log_path: Option<&Path>,
     timeout_secs: u64,
 ) -> Result<(), String> {
+    AdbClient::unfreeze_waydroid_container();
     if rustydroid::runtime::adapt::is_android_user_ready() {
         return Ok(());
     }
@@ -399,7 +406,6 @@ fn start_waydroid_session_and_wait() -> Result<(), String> {
         srun.args([
             "--user",
             "--quiet",
-            "--collect",
             "--unit=rustydroid-waydroid-session",
             &format!("--setenv=WAYLAND_DISPLAY={}", wayland_disp),
             "--",
@@ -545,7 +551,7 @@ fn main() -> anyhow::Result<()> {
 
             if !is_headless_or_test_env() && check_waydroid_runner_state() == WaydroidRunnerState::Running {
                 println!("Installing adapted package into Waydroid...");
-                let serial = try_connect_waydroid_adb();
+                let serial = try_connect_waydroid_adb_with_retry(3, 500);
                 install_bundle_adapted(&inspection, &profile, serial.as_deref())?;
                 println!("Installed {} in Waydroid.", meta.package_name);
             } else if SessionManager::is_running() && AdbClient::is_adb_available() {
@@ -903,13 +909,21 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Shell { args } => {
             if let Some(serial) = try_connect_waydroid_adb() {
-                let cmd_slice: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                let output = AdbClient::shell_for(&serial, &cmd_slice)?;
-                print!("{}", output);
+                if args.is_empty() {
+                    AdbClient::interactive_shell(Some(&serial))?;
+                } else {
+                    let cmd_slice: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    let output = AdbClient::shell_for(&serial, &cmd_slice)?;
+                    print!("{}", output);
+                }
             } else if AdbClient::is_adb_available() && AdbClient::is_device_connected() {
-                let cmd_slice: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                let output = AdbClient::shell_command(&cmd_slice)?;
-                print!("{}", output);
+                if args.is_empty() {
+                    AdbClient::interactive_shell(None)?;
+                } else {
+                    let cmd_slice: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    let output = AdbClient::shell_command(&cmd_slice)?;
+                    print!("{}", output);
+                }
             } else {
                 println!("⚠️ ADB not available. Running inside local container environment:");
                 let config = ContainerConfig::default();
@@ -982,17 +996,31 @@ fn run_privileged_setup_script(script: &Path, success_msg: &str) -> anyhow::Resu
             anyhow::bail!("Setup failed with exit code {:?}", status.code());
         }
     } else {
-        let cmd_str = format!(
-            "sudo '{}'; echo ''; read -p 'Press Enter to close...'",
-            script.display()
-        );
-        let spawned = std::process::Command::new("kitty")
-            .args(&["-e", "bash", "-c", &cmd_str])
-            .spawn();
-        if spawned.is_err() {
-            let status = std::process::Command::new("pkexec").arg(script).status()?;
-            if !status.success() {
-                anyhow::bail!("Setup via pkexec did not complete");
+        let kitty_status = std::process::Command::new("kitty")
+            .args([
+                "-e",
+                "bash",
+                "-c",
+                "sudo \"$1\"; status=$?; echo ''; read -p 'Press Enter to close...'; exit $status",
+                "_",
+            ])
+            .arg(script)
+            .status();
+        match kitty_status {
+            Ok(status) => {
+                if status.success() {
+                    println!("{}", success_msg);
+                } else {
+                    anyhow::bail!("Setup failed with exit code {:?}", status.code());
+                }
+            }
+            Err(_) => {
+                let status = std::process::Command::new("pkexec").arg(script).status()?;
+                if status.success() {
+                    println!("{}", success_msg);
+                } else {
+                    anyhow::bail!("Setup via pkexec did not complete");
+                }
             }
         }
     }
@@ -1009,6 +1037,14 @@ mod tests {
         assert_eq!(
             normalize_path_str("file:///home/kiri/%D0%97%D0%B0%D0%B3%D1%80%D1%83%D0%B7%D0%BA%D0%B8/My%20App.apk"),
             "/home/kiri/Загрузки/My App.apk"
+        );
+        assert_eq!(
+            normalize_path_str("file://localhost/tmp/100%working%20app.apk"),
+            "/tmp/100%working app.apk"
+        );
+        assert_eq!(
+            normalize_path_str("file:///tmp/trailing%"),
+            "/tmp/trailing%"
         );
         assert_eq!(
             normalize_path_str("/home/kiri/test.apk"),

@@ -18,14 +18,14 @@ pub fn sanitize_desktop_entry_value(value: &str) -> String {
         .to_string()
 }
 
-/// Sanitize package name to ensure it contains no newlines, carriage returns,
-/// or directory separators that could corrupt desktop entries or paths.
+/// Sanitize package name to ensure it contains no newlines, quotes, shell
+/// metacharacters, or directory separators that could corrupt desktop entries or paths.
 pub fn sanitize_package_name(package_name: &str) -> String {
     let sanitized: String = package_name
         .chars()
-        .filter(|&c| c != '\r' && c != '\n' && c != '/' && c != '\\')
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
         .collect();
-    let trimmed = sanitized.trim();
+    let trimmed = sanitized.trim_matches('.');
     if trimmed.is_empty() {
         "unknown.package".to_string()
     } else {
@@ -77,17 +77,21 @@ impl DesktopIntegration {
 
         let icon_name = format!("rustydroid-{}", clean_pkg);
 
-        // Save icon if present
+        // Save icon if present (removing any stale icon with the other extension)
         if let Some(ref icon_bytes) = meta.icon_data {
             let icons_dir = Self::get_icons_dir();
             if fs::create_dir_all(&icons_dir).is_ok() {
-                let ext = if let Some(ref p) = meta.icon_path_in_apk {
-                    if p.ends_with(".webp") { "webp" } else { "png" }
+                let (ext, other_ext) = if let Some(ref p) = meta.icon_path_in_apk {
+                    if p.ends_with(".webp") { ("webp", "png") } else { ("png", "webp") }
                 } else if icon_bytes.starts_with(b"RIFF") {
-                    "webp"
+                    ("webp", "png")
                 } else {
-                    "png"
+                    ("png", "webp")
                 };
+                let stale_icon = icons_dir.join(format!("{}.{}", icon_name, other_ext));
+                if stale_icon.exists() {
+                    let _ = fs::remove_file(stale_icon);
+                }
                 let icon_file = icons_dir.join(format!("{}.{}", icon_name, ext));
                 let _ = fs::write(icon_file, icon_bytes);
             }
@@ -151,5 +155,23 @@ StartupWMClass={pkg}
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_package_name_strips_shell_and_quotes() {
+        assert_eq!(
+            sanitize_package_name("com.example.'$(id)'/.."),
+            "com.example.id"
+        );
+        assert_eq!(
+            sanitize_package_name("org.app \"--flag\"; rm -rf"),
+            "org.app--flagrm-rf"
+        );
+        assert_eq!(sanitize_package_name("com.valid.app_1:2"), "com.valid.app_1:2");
     }
 }

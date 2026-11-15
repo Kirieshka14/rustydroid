@@ -138,12 +138,22 @@ impl<'a> AxmlParser<'a> {
                 RES_XML_RESOURCE_MAP_TYPE => {}
                 RES_XML_START_NAMESPACE_TYPE | RES_XML_END_NAMESPACE_TYPE => {}
                 RES_XML_START_ELEMENT_TYPE => {
+                    if chunk_pos + 36 > next_chunk_pos {
+                        cursor.set_position(next_chunk_pos as u64);
+                        continue;
+                    }
+                    let header_size = ((chunk_type_raw >> 16) & 0xFFFF) as usize;
+                    let base_header = if header_size >= 16 && chunk_pos + header_size <= next_chunk_pos {
+                        header_size
+                    } else {
+                        16
+                    };
                     let _line_number = cursor.read_u32::<LittleEndian>()?;
                     let _comment = cursor.read_u32::<LittleEndian>()?;
                     let _ns_idx = cursor.read_u32::<LittleEndian>()?;
                     let name_idx = cursor.read_u32::<LittleEndian>()?;
-                    let _attr_start = cursor.read_u16::<LittleEndian>()?;
-                    let _attr_size = cursor.read_u16::<LittleEndian>()?;
+                    let attr_start = cursor.read_u16::<LittleEndian>()? as usize;
+                    let attr_size = cursor.read_u16::<LittleEndian>()? as usize;
                     let attr_count = cursor.read_u16::<LittleEndian>()? as usize;
                     let _id_idx = cursor.read_u16::<LittleEndian>()?;
                     let _class_idx = cursor.read_u16::<LittleEndian>()?;
@@ -152,7 +162,18 @@ impl<'a> AxmlParser<'a> {
                     let tag_name = self.get_string(name_idx).unwrap_or_else(|| format!("tag_{}", name_idx));
                     let mut attributes = HashMap::new();
 
-                    for _ in 0..attr_count {
+                    let first_attr_pos = chunk_pos + base_header + attr_start.max(20);
+                    let effective_attr_size = attr_size.max(20);
+
+                    for i in 0..attr_count {
+                        let attr_pos = match first_attr_pos.checked_add(i.saturating_mul(effective_attr_size)) {
+                            Some(p) => p,
+                            None => break,
+                        };
+                        if attr_pos + 20 > next_chunk_pos {
+                            break;
+                        }
+                        cursor.set_position(attr_pos as u64);
                         let attr_ns_idx = cursor.read_u32::<LittleEndian>()?;
                         let attr_name_idx = cursor.read_u32::<LittleEndian>()?;
                         let attr_val_idx = cursor.read_u32::<LittleEndian>()?;
@@ -337,5 +358,98 @@ impl<'a> AxmlParser<'a> {
 
     pub fn string_pool(&self) -> &[String] {
         &self.string_pool
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_u16(buf: &mut Vec<u8>, v: u16) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn test_axml_start_element_clamps_malformed_attr_count_to_chunk() {
+        // String pool containing ["manifest", "package", "com.test.safe"]
+        let strings = ["manifest", "package", "com.test.safe"];
+        let mut sp_strings = Vec::new();
+        let mut sp_offsets = Vec::new();
+        for s in strings {
+            sp_offsets.push(sp_strings.len() as u32);
+            sp_strings.push(s.len() as u8);
+            sp_strings.push(s.len() as u8);
+            sp_strings.extend_from_slice(s.as_bytes());
+            sp_strings.push(0);
+        }
+        while sp_strings.len() % 4 != 0 {
+            sp_strings.push(0);
+        }
+        let sp_header = 28u32;
+        let sp_strings_start = sp_header + (strings.len() as u32) * 4;
+        let sp_size = sp_strings_start + sp_strings.len() as u32;
+        let mut sp_chunk = Vec::new();
+        push_u32(&mut sp_chunk, (0x001Cu32 << 16) | (RES_STRING_POOL_TYPE as u32));
+        push_u32(&mut sp_chunk, sp_size);
+        push_u32(&mut sp_chunk, strings.len() as u32);
+        push_u32(&mut sp_chunk, 0);
+        push_u32(&mut sp_chunk, 1 << 8); // UTF-8
+        push_u32(&mut sp_chunk, sp_strings_start);
+        push_u32(&mut sp_chunk, 0);
+        for off in sp_offsets {
+            push_u32(&mut sp_chunk, off);
+        }
+        sp_chunk.extend_from_slice(&sp_strings);
+
+        // START_ELEMENT chunk with 1 real attribute but malformed attr_count = 99
+        let mut se_chunk = Vec::new();
+        let se_size = 36u32 + 20u32;
+        push_u32(&mut se_chunk, (0x0010u32 << 16) | (RES_XML_START_ELEMENT_TYPE as u32));
+        push_u32(&mut se_chunk, se_size);
+        push_u32(&mut se_chunk, 1); // line_number
+        push_u32(&mut se_chunk, 0xFFFF_FFFF); // comment
+        push_u32(&mut se_chunk, 0xFFFF_FFFF); // ns
+        push_u32(&mut se_chunk, 0); // name = "manifest"
+        push_u16(&mut se_chunk, 0x0014); // attr_start
+        push_u16(&mut se_chunk, 0x0014); // attr_size
+        push_u16(&mut se_chunk, 99); // malformed attr_count!
+        push_u16(&mut se_chunk, 0);
+        push_u16(&mut se_chunk, 0);
+        push_u16(&mut se_chunk, 0);
+        // 1 valid 20-byte attribute: package="com.test.safe"
+        push_u32(&mut se_chunk, 0xFFFF_FFFF); // ns
+        push_u32(&mut se_chunk, 1); // name = "package"
+        push_u32(&mut se_chunk, 2); // raw_value = "com.test.safe"
+        se_chunk.extend_from_slice(&[8, 0, 0, 3]); // size=8, type=string(3)
+        push_u32(&mut se_chunk, 2); // data = 2
+
+        // END_ELEMENT chunk (24 bytes)
+        let mut ee_chunk = Vec::new();
+        push_u32(&mut ee_chunk, (0x0010u32 << 16) | (RES_XML_END_ELEMENT_TYPE as u32));
+        push_u32(&mut ee_chunk, 24);
+        push_u32(&mut ee_chunk, 1);
+        push_u32(&mut ee_chunk, 0xFFFF_FFFF);
+        push_u32(&mut ee_chunk, 0xFFFF_FFFF);
+        push_u32(&mut ee_chunk, 0);
+
+        let total_size = 8 + sp_chunk.len() + se_chunk.len() + ee_chunk.len();
+        let mut doc = Vec::with_capacity(total_size);
+        push_u32(&mut doc, 0x0008_0003); // RES_XML_TYPE + 8-byte header
+        push_u32(&mut doc, total_size as u32);
+        doc.extend_from_slice(&sp_chunk);
+        doc.extend_from_slice(&se_chunk);
+        doc.extend_from_slice(&ee_chunk);
+
+        let mut parser = AxmlParser::new(&doc);
+        let root = parser.parse().expect("malformed attr_count should clamp safely");
+        assert_eq!(root.name, "manifest");
+        assert_eq!(
+            root.attributes.get("package").and_then(|a| a.value_str.as_deref()),
+            Some("com.test.safe")
+        );
     }
 }

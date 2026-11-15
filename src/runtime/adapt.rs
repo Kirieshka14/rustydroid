@@ -280,11 +280,22 @@ pub fn install_bundle_adapted(
                             "Removing existing {} (signature mismatch)...",
                             inspection.metadata.package_name
                         );
-                        AdbClient::uninstall_target(ser, &inspection.metadata.package_name)?;
-                        let retry_outcome =
-                            AdbClient::install_with_adaptation(ser, &plan.apk_paths, &opts)?;
-                        finish_adb_install(ser, retry_outcome, inspection, &plan)?;
-                        return Ok(());
+                        if let Err(e) =
+                            AdbClient::uninstall_target(ser, &inspection.metadata.package_name)
+                        {
+                            cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
+                            return Err(e);
+                        }
+                        match AdbClient::install_with_adaptation(ser, &plan.apk_paths, &opts) {
+                            Ok(retry_outcome) => {
+                                finish_adb_install(ser, retry_outcome, inspection, &plan)?;
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
+                                return Err(e);
+                            }
+                        }
                     }
                     cleanup_staging_dir(&inspection.compat.format, &plan.staging_dir);
                     bail!(
@@ -1031,15 +1042,41 @@ fn snap_launched_app_window(serial: &str, package: &str, fixed_dpi: Option<u32>)
     }
 }
 
+fn is_proc_cmdline_matching(needle: &str) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(raw) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if cmdline.contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
 fn ensure_window_sync_daemon_running() {
     let unit_active = Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", "rustydroid-window-sync.service"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if unit_active {
+    if unit_active || is_proc_cmdline_matching("internal-window-sync") {
         return;
     }
+    let _ = Command::new("systemctl")
+        .args(["--user", "reset-failed", "rustydroid-window-sync.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -1047,7 +1084,6 @@ fn ensure_window_sync_daemon_running() {
         .args([
             "--user",
             "--quiet",
-            "--collect",
             "--unit=rustydroid-window-sync",
             "--description=RustyDroid Hyprland to Android dynamic window sync",
         ])
@@ -1058,7 +1094,7 @@ fn ensure_window_sync_daemon_running() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !systemd_ok {
+    if !systemd_ok && !is_proc_cmdline_matching("internal-window-sync") {
         let _ = Command::new(&exe)
             .arg("internal-window-sync")
             .stdin(Stdio::null())
@@ -1080,6 +1116,7 @@ fn is_hypr_layout_event(line: &str) -> bool {
         "workspace>>",
         "workspacev2>>",
         "submap>>",
+        "activewindow>>waydroid.",
     ];
     PREFIXES.iter().any(|p| line.starts_with(p))
 }
@@ -1232,8 +1269,12 @@ fn sync_changed_waydroid_windows(
             }
         }
         if all_ok {
+            let is_new_window = !synced_sizes.contains_key(&win.package);
             synced_sizes.insert(win.package.clone(), (win.width, win.height));
             if win.focused && fixed_dpi.is_none() {
+                if is_new_window {
+                    *last_density = None;
+                }
                 let target_dpi = compute_smart_density(win.width, win.height);
                 apply_density_if_needed(&serial, target_dpi, last_density);
             }
