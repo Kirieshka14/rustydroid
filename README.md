@@ -1,4 +1,25 @@
-# RustyDroid
+<div align="center">
+  <img src="assets/logo.png" alt="RustyDroid Logo" width="220" />
+  <h1>RustyDroid</h1>
+  <p>
+    <strong>Native-feeling Android <code>.apk</code>, <code>.xapk</code>, <code>.apks</code>, and <code>.apkm</code> runner for Linux Wayland — built in Rust on top of Waydroid.</strong>
+  </p>
+  <p>
+    <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Built%20with-Rust-EA580C?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust" /></a>
+    <a href="https://waydro.id/"><img src="https://img.shields.io/badge/Waydroid-Android%20Container-3DDC84?style=for-the-badge&logo=android&logoColor=black" alt="Waydroid" /></a>
+    <a href="https://hyprland.org/"><img src="https://img.shields.io/badge/Hyprland-Window%20Sync-00ADD8?style=for-the-badge&logo=wayland&logoColor=white" alt="Hyprland Window Sync" /></a>
+    <a href="https://aur.archlinux.org/packages/rustydroid"><img src="https://img.shields.io/badge/AUR-rustydroid-1793D1?style=for-the-badge&logo=archlinux&logoColor=white" alt="AUR" /></a>
+    <a href="packaging/PKGBUILD"><img src="https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge" alt="License: MIT" /></a>
+  </p>
+  <p>
+    <a href="#purpose">Purpose</a> •
+    <a href="#requirements">Requirements</a> •
+    <a href="#installation">Installation</a> •
+    <a href="#usage">Usage</a>
+  </p>
+</div>
+
+---
 
 > **Disambiguation:** This project (`Kirieshka14/rustydroid`) is a Linux/Wayland CLI utility and compatibility wrapper around Waydroid for installing and running Android `.apk`, `.xapk`, `.apks`, and `.apkm` packages on desktop Linux. It has **no relation or affiliation** with the Android RAT / malware known under the name "RustyDroid".
 
