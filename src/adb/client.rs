@@ -56,23 +56,23 @@ impl AdbClient {
 
     /// Checks if an Android device or container adb daemon is connected
     pub fn is_device_connected() -> bool {
-        Command::new("adb")
-            .args(&["get-state"])
-            .output()
+        Self::run_adb_with_timeout(&["get-state"], 3)
             .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "device")
             .unwrap_or(false)
     }
 
     /// Installs an APK into the running container
     pub fn install_apk(apk_path: &str) -> Result<String> {
-        let output = Command::new("adb")
-            .args(&["install", "-r", apk_path])
-            .output()
+        Self::unfreeze_waydroid_container();
+        let output = Self::run_adb_with_timeout(&["install", "-r", apk_path], 120)
             .context("Failed to execute adb install")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+        if output.status.code() == Some(124) {
+            bail!("adb install timed out");
+        }
         if !output.status.success() {
             bail!("adb install failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
         }
@@ -82,20 +82,20 @@ impl AdbClient {
 
     /// Launches the main activity for a package
     pub fn start_activity(package_name: &str, activity_name: &str) -> Result<String> {
-        let target = if activity_name.starts_with('.') {
-            format!("{}/{}", package_name, activity_name)
-        } else if !activity_name.contains('/') {
+        let target = if activity_name.starts_with('.') || !activity_name.contains('/') {
             format!("{}/{}", package_name, activity_name)
         } else {
             activity_name.to_string()
         };
 
-        let output = Command::new("adb")
-            .args(&["shell", "am", "start", "-n", &target])
-            .output()
+        Self::unfreeze_waydroid_container();
+        let output = Self::run_adb_with_timeout(&["shell", "am", "start", "-n", &target], 10)
             .context("Failed to execute adb shell am start")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if output.status.code() == Some(124) {
+            bail!("adb shell am start timed out");
+        }
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             bail!("am start failed: {}\n{}", stdout, stderr);
@@ -106,20 +106,16 @@ impl AdbClient {
 
     /// Stops an application
     pub fn stop_app(package_name: &str) -> Result<()> {
-        let _ = Command::new("adb")
-            .args(&["shell", "am", "force-stop", package_name])
-            .status();
+        Self::unfreeze_waydroid_container();
+        let _ = Self::run_adb_with_timeout(&["shell", "am", "force-stop", package_name], 10);
         Ok(())
     }
 
     /// Lists installed third-party packages
     pub fn list_packages() -> Result<Vec<String>> {
-        let output = Command::new("adb")
-            .args(&["shell", "pm", "list", "packages", "-3"])
-            .output()
+        let text = Self::shell_command(&["pm", "list", "packages", "-3"])
             .context("Failed to execute pm list packages")?;
 
-        let text = String::from_utf8_lossy(&output.stdout);
         let mut packages = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -130,15 +126,9 @@ impl AdbClient {
         Ok(packages)
     }
 
-    /// Executes arbitrary shell command inside container
+    /// Executes arbitrary shell command inside container with bounded timeout
     pub fn shell_command(cmd_args: &[&str]) -> Result<String> {
-        let mut cmd = Command::new("adb");
-        cmd.arg("shell");
-        for a in cmd_args {
-            cmd.arg(a);
-        }
-        let output = cmd.output().context("Failed to execute adb shell command")?;
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Self::run_adb_shell(&[], cmd_args, "default")
     }
 
     /// Unfreezes a frozen Waydroid container over system D-Bus before ADB calls so adbd responds immediately.
@@ -478,13 +468,15 @@ impl AdbClient {
         Ok(())
     }
 
-    pub fn shell_for(serial: &str, cmd_args: &[&str]) -> Result<String> {
+    fn run_adb_shell(prefix: &[&str], cmd_args: &[&str], target_label: &str) -> Result<String> {
         Self::unfreeze_waydroid_container();
-        let mut full_args = vec!["-s", serial, "shell"];
+        let mut full_args = Vec::with_capacity(prefix.len() + 1 + cmd_args.len());
+        full_args.extend_from_slice(prefix);
+        full_args.push("shell");
         full_args.extend_from_slice(cmd_args);
         let out = Self::run_adb_with_timeout(&full_args, 10)?;
         if out.status.code() == Some(124) {
-            bail!("adb shell timed out for {}", serial);
+            bail!("adb shell timed out for {}", target_label);
         }
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
@@ -496,10 +488,14 @@ impl AdbClient {
                 || err_lower.contains("closed")
                 || err_lower.contains("daemon not running");
             if is_adb_transport_err {
-                bail!("adb shell transport error for {}: {}", serial, err.trim());
+                bail!("adb shell transport error for {}: {}", target_label, err.trim());
             }
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    pub fn shell_for(serial: &str, cmd_args: &[&str]) -> Result<String> {
+        Self::run_adb_shell(&["-s", serial], cmd_args, serial)
     }
 
     pub fn interactive_shell(serial: Option<&str>) -> Result<()> {

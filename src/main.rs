@@ -776,6 +776,9 @@ fn main() -> anyhow::Result<()> {
             let session_info = SessionManager::get_state();
             println!("\n  • Session Status:     {}", match session_info {
                 Some(s) => format!("RUNNING (PID: {}, Mode: {})", s.pid, s.display_mode),
+                None if runner_state == WaydroidRunnerState::Running => {
+                    "STOPPED (native; Waydroid Graphical Runner active)".to_string()
+                }
                 None => "STOPPED".to_string(),
             });
 
@@ -924,10 +927,24 @@ fn main() -> anyhow::Result<()> {
                     let output = AdbClient::shell_command(&cmd_slice)?;
                     print!("{}", output);
                 }
+            } else if check_waydroid_runner_state() == WaydroidRunnerState::Running {
+                let ip = AdbClient::detect_waydroid_ip();
+                anyhow::bail!(
+                    "Waydroid session is running, but ADB ({}:5555) is unreachable.\n\
+                     Try restarting the Waydroid session: waydroid session stop && waydroid session start",
+                    ip
+                );
             } else {
                 println!("⚠️ ADB not available. Running inside local container environment:");
                 let config = ContainerConfig::default();
-                let mut cmd = NamespaceManager::build_bwrap_command(&config, &["sh"])?;
+                let mut cmd = if args.is_empty() {
+                    NamespaceManager::build_bwrap_command(&config, &["sh"])?
+                } else if args.len() == 1 {
+                    NamespaceManager::build_bwrap_command(&config, &["sh", "-c", &args[0]])?
+                } else {
+                    let cmd_slice: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    NamespaceManager::build_bwrap_command(&config, &cmd_slice)?
+                };
                 cmd.status()?;
             }
         }
